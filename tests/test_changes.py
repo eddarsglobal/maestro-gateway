@@ -1,9 +1,11 @@
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from maestro_gateway.changes import (
     ChangeProposalStore,
+    ProposalApplyError,
     ProposalConflictError,
     ProposalStateError,
 )
@@ -152,6 +154,288 @@ class ChangeProposalTests(unittest.TestCase):
                     content="x\n",
                     operation="edit",
                 )
+
+
+    def test_apply_requires_explicit_approval(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            target = root / "hello.txt"
+            target.write_text(
+                "before\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="hello.txt",
+                content="after\n",
+                operation="edit",
+            )
+
+            with self.assertRaises(
+                ProposalStateError
+            ):
+                changes.apply(
+                    proposal["id"]
+                )
+
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "before\n",
+            )
+
+    def test_approved_edit_is_atomically_applied(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            target = root / "hello.txt"
+            target.write_text(
+                "before\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="hello.txt",
+                content="after\n",
+                operation="edit",
+            )
+
+            approved = changes.approve(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                approved["status"],
+                "APPROVED",
+            )
+
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "before\n",
+            )
+
+            applied = changes.apply(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                applied["status"],
+                "APPLIED",
+            )
+
+            self.assertTrue(
+                applied["workspace_write_performed"]
+            )
+
+            self.assertEqual(
+                applied["applied_sha256"],
+                applied["after_sha256"],
+            )
+
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "after\n",
+            )
+
+    def test_approved_create_is_atomically_applied(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            target = root / "created.txt"
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="created.txt",
+                content="created\n",
+                operation="write",
+            )
+
+            changes.approve(
+                proposal["id"]
+            )
+
+            self.assertFalse(
+                target.exists()
+            )
+
+            applied = changes.apply(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                applied["status"],
+                "APPLIED",
+            )
+
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "created\n",
+            )
+
+    def test_apply_rechecks_sha_after_approval(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            target = root / "hello.txt"
+            target.write_text(
+                "v1\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="hello.txt",
+                content="v2\n",
+                operation="edit",
+            )
+
+            changes.approve(
+                proposal["id"]
+            )
+
+            target.write_text(
+                "external-change\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(
+                ProposalConflictError
+            ):
+                changes.apply(
+                    proposal["id"]
+                )
+
+            self.assertEqual(
+                changes.get(
+                    proposal["id"]
+                )["status"],
+                "STALE",
+            )
+
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "external-change\n",
+            )
+
+    def test_applied_proposal_cannot_be_replayed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            target = root / "hello.txt"
+            target.write_text(
+                "before\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="hello.txt",
+                content="after\n",
+                operation="edit",
+            )
+
+            changes.approve(
+                proposal["id"]
+            )
+
+            changes.apply(
+                proposal["id"]
+            )
+
+            with self.assertRaises(
+                ProposalStateError
+            ):
+                changes.apply(
+                    proposal["id"]
+                )
+
+    def test_rejected_proposal_cannot_be_applied(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            target = root / "hello.txt"
+            target.write_text(
+                "before\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="hello.txt",
+                content="after\n",
+                operation="edit",
+            )
+
+            changes.reject(
+                proposal["id"],
+                reason="no",
+            )
+
+            with self.assertRaises(
+                ProposalStateError
+            ):
+                changes.apply(
+                    proposal["id"]
+                )
+
+    def test_verification_failure_rolls_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            target = root / "hello.txt"
+            target.write_text(
+                "before\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="hello.txt",
+                content="after\n",
+                operation="edit",
+            )
+
+            changes.approve(
+                proposal["id"]
+            )
+
+            with mock.patch.object(
+                changes,
+                "_verify_applied_target",
+                side_effect=OSError(
+                    "forced verification failure"
+                ),
+            ):
+                with self.assertRaises(
+                    ProposalApplyError
+                ):
+                    changes.apply(
+                        proposal["id"]
+                    )
+
+            final = changes.get(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                final["status"],
+                "ROLLED_BACK",
+            )
+
+            self.assertTrue(
+                final["workspace_write_performed"]
+            )
+
+            self.assertTrue(
+                final["workspace_state_restored"]
+            )
+
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "before\n",
+            )
 
 
 if __name__ == "__main__":

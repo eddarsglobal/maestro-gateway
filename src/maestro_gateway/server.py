@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .capabilities import CapabilityRegistry
 from .changes import (
+    ProposalApplyError,
     ChangeProposalStore,
     ProposalConflictError,
     ProposalStateError,
@@ -423,14 +424,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "P0.6A"
                     ),
                     "change_protocol": (
-                        "P0.6B.1"
+                        "P0.6B.3"
                     ),
-                    "workspace_write_execution": False,
+                    "workspace_write_execution": True,
                     "conversation_storage": (
                         "local"
                     ),
                     "workspace": (
-                        "read_only_governed"
+                        "governed_atomic_write"
                     ),
                     "native_workspace_picker": (
                         "macos" if sys.platform == "darwin" else "unsupported"
@@ -483,14 +484,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "P0.6A"
                     ),
                     "change_protocol": (
-                        "P0.6B.1"
+                        "P0.6B.3"
                     ),
-                    "workspace_write_execution": False,
+                    "workspace_write_execution": True,
                     "conversation_storage": (
                         "local"
                     ),
                     "workspace": (
-                        "read_only_governed"
+                        "governed_atomic_write"
                     ),
                     "native_workspace_picker": (
                         "macos" if sys.platform == "darwin" else "unsupported"
@@ -936,7 +937,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if (
                 len(parts) == 3
                 and parts[0] == "changes"
-                and parts[2] in {"approve", "reject"}
+                and parts[2] in {"approve", "reject", "apply"}
             ):
                 if not self._require_session():
                     return
@@ -953,7 +954,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             .changes
                             .approve(change_id)
                         )
-                    else:
+                    elif action == "reject":
                         proposal = (
                             self.server
                             .changes
@@ -961,6 +962,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                 change_id,
                                 reason=payload.get("reason"),
                             )
+                        )
+                    else:
+                        proposal = (
+                            self.server
+                            .changes
+                            .apply(change_id)
                         )
                 except KeyError:
                     self._send_json(
@@ -987,6 +994,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         {
                             "error": "invalid_change_state",
                             "message": str(exc),
+                        },
+                    )
+                    return
+                except ProposalApplyError as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {
+                            "error": "change_apply_failed",
+                            "message": str(exc),
+                            "proposal": exc.proposal,
                         },
                     )
                     return
@@ -1456,7 +1473,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6B.1"
+        "MAESTRO LOCAL GATEWAY — P0.6B.3"
     )
     print("=" * 72)
     print(
@@ -1467,7 +1484,7 @@ def main() -> int:
         f"Runtime : {config.runtime_dir}"
     )
     print(
-        "Workspace: governed read + staged change proposals"
+        "Workspace: governed read + atomic governed writes"
     )
     print(
         "Quality : anti-echo + recoverable tool guard enabled"
@@ -1476,10 +1493,10 @@ def main() -> int:
         "Picker  : macOS native file/folder chooser"
     )
     print(
-        "Changes : diff + SHA-256 + approval state; no workspace write"
+        "Changes : diff + SHA-256 + approval + separate atomic apply"
     )
     print(
-        "Write   : proposal/approval only; workspace apply DISABLED"
+        "Write   : explicit approval + governed atomic apply ENABLED"
     )
     print("=" * 72)
 

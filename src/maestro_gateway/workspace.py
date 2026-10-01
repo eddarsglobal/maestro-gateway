@@ -378,7 +378,7 @@ class WorkspaceRegistry:
         parent = target.parent
         if not parent.exists() or not parent.is_dir():
             raise ValueError(
-                "Parent directory must already exist in P0.6B.1"
+                "Parent directory must already exist in P0.6B.3"
             )
 
         if target.exists() and target.is_dir():

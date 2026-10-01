@@ -35,6 +35,12 @@ class CapabilityRegistry:
             else "available_requires_workspace"
         )
 
+        governed_mutation_state = (
+            "available_governed_requires_user_approval"
+            if workspace_active
+            else "available_requires_workspace"
+        )
+
         capabilities = [
             Capability(
                 "conversation.context",
@@ -76,42 +82,42 @@ class CapabilityRegistry:
             Capability(
                 "filesystem.write",
                 "filesystem",
-                "proposal_only_requires_user_approval",
-                "Stage a governed write/create proposal; application is disabled in P0.6B.1.",
+                governed_mutation_state,
+                "Propose, approve, and separately atomically apply a governed write/create inside an authorized workspace.",
                 approval="user",
             ),
             Capability(
                 "filesystem.edit",
                 "filesystem",
-                "proposal_only_requires_user_approval",
-                "Stage a governed full-content edit proposal; application is disabled in P0.6B.1.",
+                governed_mutation_state,
+                "Propose, approve, and separately atomically apply a governed full-content edit inside an authorized workspace.",
                 approval="user",
             ),
             Capability(
                 "filesystem.patch",
                 "filesystem",
-                "proposal_only_requires_user_approval",
-                "Stage a governed patch proposal with diff/hash evidence; application is disabled in P0.6B.1.",
+                governed_mutation_state,
+                "Propose, approve, and separately atomically apply a governed patch with diff and SHA-256 evidence.",
                 approval="user",
             ),
             Capability(
                 "filesystem.delete",
                 "filesystem",
-                "not_available_p0_6b1",
-                "Delete remains intentionally disabled in P0.6B.1.",
+                "not_available_p0_6b3",
+                "Delete remains intentionally disabled in P0.6B.3.",
                 approval="future_governed_delete",
             ),
             Capability(
                 "terminal.run",
                 "development",
-                "not_available_p0_6b1",
+                "not_available_p0_6b3",
                 "Terminal execution is planned for a later governed stage.",
                 approval="future_sandbox",
             ),
             Capability(
                 "git.execute",
                 "development",
-                "not_available_p0_6b1",
+                "not_available_p0_6b3",
                 "Git execution is planned for a later governed stage.",
                 approval="future_sandbox",
             ),
