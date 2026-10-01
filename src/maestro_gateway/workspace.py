@@ -319,6 +319,79 @@ class WorkspaceRegistry:
 
         return target
 
+    def resolve_change_target(
+        self,
+        workspace_id: str,
+        relative: str,
+    ) -> dict[str, Any]:
+        row, selected = self._scope(workspace_id)
+        rel = str(relative or "").strip()
+
+        if rel in {"", ".", "/"}:
+            raise ValueError("Change target must identify a file")
+
+        if row["kind"] == "file":
+            if rel not in {selected.name}:
+                raise PermissionError(
+                    "This workspace authorizes one file only"
+                )
+            target = selected
+            display = selected.name
+        else:
+            rel_path = Path(rel)
+
+            if rel_path.is_absolute() or ".." in rel_path.parts:
+                raise PermissionError(
+                    "Path escapes the authorized workspace"
+                )
+
+            if any(part in IGNORED_DIRS for part in rel_path.parts):
+                raise PermissionError(
+                    "Change target is inside a protected/ignored directory"
+                )
+
+            cursor = selected
+            for part in rel_path.parts:
+                cursor = cursor / part
+                if cursor.exists() and cursor.is_symlink():
+                    raise PermissionError(
+                        "Symlink mutation targets are not allowed"
+                    )
+
+            candidate = selected / rel_path
+            target = candidate.resolve(strict=False)
+
+            try:
+                target.relative_to(selected)
+            except ValueError as exc:
+                raise PermissionError(
+                    "Path escapes the authorized workspace"
+                ) from exc
+
+            display = str(target.relative_to(selected))
+
+        if _is_sensitive(target):
+            raise PermissionError(
+                "Sensitive credential file mutation denied"
+            )
+
+        parent = target.parent
+        if not parent.exists() or not parent.is_dir():
+            raise ValueError(
+                "Parent directory must already exist in P0.6B.1"
+            )
+
+        if target.exists() and target.is_dir():
+            raise ValueError("Change target must be a file")
+
+        return {
+            "workspace_id": row["id"],
+            "workspace_label": row["label"],
+            "path": display,
+            "absolute_path": str(target),
+            "exists": target.exists(),
+        }
+
     def tree(
         self,
         workspace_id: str,

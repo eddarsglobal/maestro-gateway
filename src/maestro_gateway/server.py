@@ -12,6 +12,11 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .capabilities import CapabilityRegistry
+from .changes import (
+    ChangeProposalStore,
+    ProposalConflictError,
+    ProposalStateError,
+)
 from .config import GatewayConfig
 from .conversations import ConversationStore
 from .core import MaestroCoreBridge
@@ -21,7 +26,7 @@ from .workspace import WorkspaceRegistry
 
 
 SERVER_NAME = "MAESTRO-Local-Gateway"
-MAX_BODY_BYTES = 64 * 1024
+MAX_BODY_BYTES = 2 * 1024 * 1024
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -131,6 +136,11 @@ class GatewayHTTPServer(ThreadingHTTPServer):
             user_root
             / "workspaces"
             / "registry.json"
+        )
+
+        self.changes = ChangeProposalStore(
+            user_root / "changes",
+            self.workspaces,
         )
 
         self.capabilities = CapabilityRegistry()
@@ -412,6 +422,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "mission_protocol": (
                         "P0.6A"
                     ),
+                    "change_protocol": (
+                        "P0.6B.1"
+                    ),
+                    "workspace_write_execution": False,
                     "conversation_storage": (
                         "local"
                     ),
@@ -430,6 +444,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "/mission",
                         "/conversations",
                         "/workspaces",
+                        "/changes",
                     ],
                 },
             )
@@ -467,6 +482,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "mission_protocol": (
                         "P0.6A"
                     ),
+                    "change_protocol": (
+                        "P0.6B.1"
+                    ),
+                    "workspace_write_execution": False,
                     "conversation_storage": (
                         "local"
                     ),
@@ -551,6 +570,68 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     ),
                 },
             )
+            return
+
+        if path == "/changes":
+            if not self._require_session():
+                return
+
+            workspace_id = query.get(
+                "workspace_id",
+                [None],
+            )[0]
+
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "changes": (
+                        self.server
+                        .changes
+                        .list(
+                            workspace_id=workspace_id
+                        )
+                    )
+                },
+            )
+            return
+
+        change_id = (
+            self._resource_id(
+                path,
+                "/changes/",
+            )
+        )
+
+        if change_id:
+            if not self._require_session():
+                return
+
+            try:
+                proposal = (
+                    self.server
+                    .changes
+                    .get(change_id)
+                )
+            except KeyError:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "error": "change_not_found",
+                        "change_id": change_id,
+                    },
+                )
+                return
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": "invalid_change_id",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, proposal)
             return
 
         if path == "/workspaces":
@@ -799,6 +880,128 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+
+        if path == "/changes/propose":
+            if not self._require_session():
+                return
+
+            try:
+                payload = self._read_json()
+                proposal = (
+                    self.server
+                    .changes
+                    .propose(
+                        workspace_id=str(
+                            payload.get("workspace_id") or ""
+                        ),
+                        relative=str(
+                            payload.get("path") or ""
+                        ),
+                        content=payload.get("content"),
+                        operation=str(
+                            payload.get("operation") or "edit"
+                        ),
+                    )
+                )
+            except KeyError as exc:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "error": "workspace_not_found",
+                        "message": str(exc),
+                    },
+                )
+                return
+            except (
+                ValueError,
+                PermissionError,
+                FileNotFoundError,
+                UnicodeDecodeError,
+            ) as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": "change_proposal_rejected",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.CREATED, proposal)
+            return
+
+        if path.startswith("/changes/"):
+            parts = path.strip("/").split("/")
+
+            if (
+                len(parts) == 3
+                and parts[0] == "changes"
+                and parts[2] in {"approve", "reject"}
+            ):
+                if not self._require_session():
+                    return
+
+                change_id = parts[1]
+                action = parts[2]
+
+                try:
+                    payload = self._read_json()
+
+                    if action == "approve":
+                        proposal = (
+                            self.server
+                            .changes
+                            .approve(change_id)
+                        )
+                    else:
+                        proposal = (
+                            self.server
+                            .changes
+                            .reject(
+                                change_id,
+                                reason=payload.get("reason"),
+                            )
+                        )
+                except KeyError:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {
+                            "error": "change_not_found",
+                            "change_id": change_id,
+                        },
+                    )
+                    return
+                except ProposalConflictError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": "change_proposal_stale",
+                            "message": str(exc),
+                            "proposal": exc.proposal,
+                        },
+                    )
+                    return
+                except ProposalStateError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": "invalid_change_state",
+                            "message": str(exc),
+                        },
+                    )
+                    return
+                except (ValueError, PermissionError) as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "change_action_rejected",
+                            "message": str(exc),
+                        },
+                    )
+                    return
+
+                self._send_json(HTTPStatus.OK, proposal)
+                return
 
         if path == "/workspaces/choose":
             if not self._require_session():
@@ -1253,7 +1456,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6A"
+        "MAESTRO LOCAL GATEWAY — P0.6B.1"
     )
     print("=" * 72)
     print(
@@ -1264,8 +1467,7 @@ def main() -> int:
         f"Runtime : {config.runtime_dir}"
     )
     print(
-        "Workspace: READ-ONLY governed "
-        "tree/read/search"
+        "Workspace: governed read + staged change proposals"
     )
     print(
         "Quality : anti-echo + recoverable tool guard enabled"
@@ -1274,7 +1476,10 @@ def main() -> int:
         "Picker  : macOS native file/folder chooser"
     )
     print(
-        "Write   : DISABLED until P0.6B"
+        "Changes : diff + SHA-256 + approval state; no workspace write"
+    )
+    print(
+        "Write   : proposal/approval only; workspace apply DISABLED"
     )
     print("=" * 72)
 
