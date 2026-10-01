@@ -18,7 +18,8 @@ from .workspace import WorkspaceRegistry
 MAX_CHANGE_BYTES = 1_048_576
 MAX_DIFF_CHARS = 120_000
 _CHANGE_ID = re.compile(r"^CHG-[A-F0-9]{12}$")
-_ALLOWED_OPERATIONS = {"write", "edit", "patch"}
+_ALLOWED_OPERATIONS = {"write", "edit", "patch", "rename", "move"}
+_RELOCATION_OPERATIONS = {"rename", "move"}
 
 
 class ProposalConflictError(RuntimeError):
@@ -59,6 +60,19 @@ def _change_id() -> str:
 
 def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+
+    return digest.hexdigest()
 
 
 def _normalize_content(value: Any) -> tuple[str, bytes]:
@@ -290,24 +304,246 @@ class ChangeProposalStore:
 
         return True, _sha256(raw)
 
+    def _relocation_snapshot(
+        self,
+        *,
+        workspace_id: str,
+        source_relative: str,
+        destination_relative: str,
+        operation: str,
+    ) -> dict[str, Any]:
+        pair = self.workspaces.resolve_relocation_targets(
+            workspace_id,
+            source_relative,
+            destination_relative,
+            operation,
+        )
+
+        source = Path(
+            str(pair["source_absolute_path"])
+        )
+
+        destination = Path(
+            str(pair["destination_absolute_path"])
+        )
+
+        def fingerprint(path: Path) -> dict[str, Any]:
+            if not path.exists():
+                return {
+                    "exists": False,
+                    "sha256": None,
+                    "size": 0,
+                    "inode": None,
+                    "device": None,
+                }
+
+            if not path.is_file():
+                raise ValueError(
+                    "P0.6C.1 relocation supports regular files only"
+                )
+
+            stat = path.stat()
+
+            return {
+                "exists": True,
+                "sha256": _sha256_file(path),
+                "size": stat.st_size,
+                "inode": stat.st_ino,
+                "device": stat.st_dev,
+            }
+
+        return {
+            **pair,
+            "source": source,
+            "destination": destination,
+            "source_state": fingerprint(source),
+            "destination_state": fingerprint(destination),
+        }
+
+    def _raise_relocation_stale(
+        self,
+        payload: dict[str, Any],
+        reason: str,
+    ) -> None:
+        now = _utc_now()
+
+        payload["status"] = "STALE"
+        payload["updated_at"] = now
+        payload["stale_reason"] = reason
+
+        payload.setdefault("history", []).append(
+            self._event(
+                "STALE",
+                reason=reason,
+            )
+        )
+
+        self._save(payload)
+
+        raise ProposalConflictError(
+            reason,
+            self._public(payload),
+        )
+
+    def _assert_relocation_fresh(
+        self,
+        payload: dict[str, Any],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        snapshot = self._relocation_snapshot(
+            workspace_id=str(payload["workspace_id"]),
+            source_relative=str(payload["path"]),
+            destination_relative=str(
+                payload["destination_path"]
+            ),
+            operation=str(payload["operation"]),
+        )
+
+        source_state = snapshot["source_state"]
+        destination_state = snapshot["destination_state"]
+
+        source_ok = (
+            source_state["exists"] is True
+            and source_state["sha256"]
+            == payload.get("before_sha256")
+            and source_state["inode"]
+            == payload.get("before_inode")
+            and source_state["device"]
+            == payload.get("before_device")
+        )
+
+        destination_ok = (
+            destination_state["exists"] is False
+        )
+
+        if not source_ok or not destination_ok:
+            self._raise_relocation_stale(
+                payload,
+                (
+                    "Relocation source or destination changed "
+                    f"before {phase}"
+                ),
+            )
+
+        return snapshot
+
+    def _propose_relocation(
+        self,
+        *,
+        workspace_id: str,
+        source_relative: str,
+        destination_relative: str,
+        operation: str,
+    ) -> dict[str, Any]:
+        destination_relative = str(
+            destination_relative or ""
+        ).strip()
+
+        if destination_relative in {"", ".", "/"}:
+            raise ValueError(
+                "destination must identify a file"
+            )
+
+        snapshot = self._relocation_snapshot(
+            workspace_id=workspace_id,
+            source_relative=source_relative,
+            destination_relative=destination_relative,
+            operation=operation,
+        )
+
+        source_state = snapshot["source_state"]
+        destination_state = snapshot["destination_state"]
+
+        if not source_state["exists"]:
+            raise FileNotFoundError(
+                "Relocation source does not exist"
+            )
+
+        if destination_state["exists"]:
+            raise FileExistsError(
+                "Relocation destination already exists"
+            )
+
+        source_path = str(snapshot["source_path"])
+        destination_path = str(
+            snapshot["destination_path"]
+        )
+
+        diff = (
+            f"--- {source_path}\n"
+            f"+++ {destination_path}\n"
+            f"@@ MAESTRO {operation.upper()} @@\n"
+            f"-{source_path}\n"
+            f"+{destination_path}\n"
+        )
+
+        now = _utc_now()
+        change_id = _change_id()
+
+        payload: dict[str, Any] = {
+            "id": change_id,
+            "protocol": "P0.6C.1",
+            "workspace_id": workspace_id,
+            "workspace_label": (
+                snapshot["workspace_label"]
+            ),
+            "operation": operation,
+            "effect": operation,
+            "path": source_path,
+            "destination_path": destination_path,
+            "before_exists": True,
+            "before_sha256": source_state["sha256"],
+            "after_sha256": source_state["sha256"],
+            "before_size": source_state["size"],
+            "after_size": source_state["size"],
+            "before_inode": source_state["inode"],
+            "before_device": source_state["device"],
+            "destination_before_exists": False,
+            "diff": diff,
+            "diff_truncated": False,
+            "status": "AWAITING_APPROVAL",
+            "approval_required": True,
+            "workspace_write_performed": False,
+            "created_at": now,
+            "updated_at": now,
+            "history": [
+                self._event("PROPOSED")
+            ],
+        }
+
+        with self._lock:
+            self._save(payload)
+
+        return self._public(payload)
+
     def propose(
         self,
         *,
         workspace_id: str,
         relative: str,
-        content: str,
+        content: Any = None,
         operation: str = "edit",
+        destination: str | None = None,
     ) -> dict[str, Any]:
         op = str(operation or "").strip().lower()
 
         if op not in _ALLOWED_OPERATIONS:
             raise ValueError(
-                "operation must be one of: write, edit, patch"
+                "operation must be one of: write, edit, patch, rename, move"
             )
 
         rel = str(relative or "").strip()
         if rel in {"", ".", "/"}:
             raise ValueError("path must identify a file")
+
+        if op in _RELOCATION_OPERATIONS:
+            return self._propose_relocation(
+                workspace_id=workspace_id,
+                source_relative=rel,
+                destination_relative=str(destination or ""),
+                operation=op,
+            )
 
         proposed_text, proposed_raw = _normalize_content(content)
         target_info = self.workspaces.resolve_change_target(
@@ -405,31 +641,40 @@ class ChangeProposalStore:
                     "Only AWAITING_APPROVAL proposals can be approved"
                 )
 
-            current_exists, current_sha256 = self._current_fingerprint(
-                workspace_id=str(payload["workspace_id"]),
-                relative=str(payload["path"]),
-            )
-
-            expected_exists = bool(payload.get("before_exists"))
-            expected_sha256 = payload.get("before_sha256")
-
             if (
-                current_exists != expected_exists
-                or current_sha256 != expected_sha256
+                payload.get("operation")
+                in _RELOCATION_OPERATIONS
             ):
-                now = _utc_now()
-                reason = (
-                    "Workspace file changed after the proposal was created"
+                self._assert_relocation_fresh(
+                    payload,
+                    phase="approval",
                 )
-                payload["status"] = "STALE"
-                payload["updated_at"] = now
-                payload["stale_reason"] = reason
-                payload.setdefault("history", []).append(
-                    self._event("STALE", reason=reason)
+            else:
+                current_exists, current_sha256 = self._current_fingerprint(
+                    workspace_id=str(payload["workspace_id"]),
+                    relative=str(payload["path"]),
                 )
-                self._save(payload)
-                public = self._public(payload)
-                raise ProposalConflictError(reason, public)
+
+                expected_exists = bool(payload.get("before_exists"))
+                expected_sha256 = payload.get("before_sha256")
+
+                if (
+                    current_exists != expected_exists
+                    or current_sha256 != expected_sha256
+                ):
+                    now = _utc_now()
+                    reason = (
+                        "Workspace file changed after the proposal was created"
+                    )
+                    payload["status"] = "STALE"
+                    payload["updated_at"] = now
+                    payload["stale_reason"] = reason
+                    payload.setdefault("history", []).append(
+                        self._event("STALE", reason=reason)
+                    )
+                    self._save(payload)
+                    public = self._public(payload)
+                    raise ProposalConflictError(reason, public)
 
             now = _utc_now()
             payload["status"] = "APPROVED"
@@ -441,6 +686,404 @@ class ChangeProposalStore:
             )
             self._save(payload)
             return self._public(payload)
+
+    def _verify_relocation_target(
+        self,
+        source: Path,
+        destination: Path,
+        expected_sha256: str,
+    ) -> str:
+        if source.exists():
+            raise OSError(
+                "Relocation source still exists"
+            )
+
+        if not destination.exists():
+            raise OSError(
+                "Relocation destination does not exist"
+            )
+
+        if not destination.is_file():
+            raise OSError(
+                "Relocation destination is not a regular file"
+            )
+
+        actual_sha256 = _sha256_file(destination)
+
+        if actual_sha256 != expected_sha256:
+            raise OSError(
+                "Relocation SHA-256 verification failed"
+            )
+
+        return actual_sha256
+
+    def _commit_relocation_recovery(
+        self,
+        payload: dict[str, Any],
+        *,
+        applied_sha256: str,
+        recovered_action: str,
+    ) -> dict[str, Any]:
+        now = _utc_now()
+
+        payload["status"] = "APPLIED"
+        payload["applied_at"] = now
+        payload["updated_at"] = now
+        payload["workspace_write_performed"] = True
+        payload["workspace_state_restored"] = False
+        payload["applied_sha256"] = applied_sha256
+        payload["applied_path"] = payload[
+            "destination_path"
+        ]
+        payload["apply_protocol"] = "P0.6C.1"
+        payload["recovered_after_restart"] = True
+
+        payload.setdefault("history", []).append(
+            self._event(recovered_action)
+        )
+
+        self._save(payload)
+        return self._public(payload)
+
+    def _apply_relocation(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        history = payload.setdefault(
+            "history",
+            [],
+        )
+
+        expected_sha256 = str(
+            payload.get("before_sha256") or ""
+        )
+
+        snapshot = self._relocation_snapshot(
+            workspace_id=str(payload["workspace_id"]),
+            source_relative=str(payload["path"]),
+            destination_relative=str(
+                payload["destination_path"]
+            ),
+            operation=str(payload["operation"]),
+        )
+
+        source = snapshot["source"]
+        destination = snapshot["destination"]
+        source_state = snapshot["source_state"]
+        destination_state = snapshot[
+            "destination_state"
+        ]
+
+        had_apply_start = any(
+            isinstance(row, dict)
+            and row.get("action") == "APPLY_STARTED"
+            for row in history
+        )
+
+        # ----------------------------------------------------
+        # Crash recovery after destination link creation.
+        # ----------------------------------------------------
+
+        if had_apply_start:
+            if (
+                not source_state["exists"]
+                and destination_state["exists"]
+                and destination_state["sha256"]
+                == expected_sha256
+            ):
+                return self._commit_relocation_recovery(
+                    payload,
+                    applied_sha256=expected_sha256,
+                    recovered_action="APPLIED_RECOVERED",
+                )
+
+            if (
+                source_state["exists"]
+                and destination_state["exists"]
+                and source_state["sha256"]
+                == expected_sha256
+                and destination_state["sha256"]
+                == expected_sha256
+            ):
+                try:
+                    same_file = os.path.samefile(
+                        source,
+                        destination,
+                    )
+                except OSError:
+                    same_file = False
+
+                if same_file:
+                    os.unlink(source)
+                    _fsync_directory(source.parent)
+
+                    actual = (
+                        self._verify_relocation_target(
+                            source,
+                            destination,
+                            expected_sha256,
+                        )
+                    )
+
+                    return (
+                        self._commit_relocation_recovery(
+                            payload,
+                            applied_sha256=actual,
+                            recovered_action=(
+                                "APPLIED_RECOVERED"
+                            ),
+                        )
+                    )
+
+        snapshot = self._assert_relocation_fresh(
+            payload,
+            phase="apply",
+        )
+
+        source = snapshot["source"]
+        destination = snapshot["destination"]
+
+        now = _utc_now()
+
+        payload["apply_started_at"] = now
+        payload["updated_at"] = now
+        payload["apply_protocol"] = "P0.6C.1"
+        payload["apply_attempts"] = (
+            int(payload.get("apply_attempts") or 0)
+            + 1
+        )
+
+        history.append(
+            self._event("APPLY_STARTED")
+        )
+
+        self._save(payload)
+
+        destination_linked = False
+        source_removed = False
+
+        try:
+            # Final policy/fingerprint check.
+            snapshot = self._assert_relocation_fresh(
+                payload,
+                phase="relocation execution",
+            )
+
+            source = snapshot["source"]
+            destination = snapshot["destination"]
+
+            # ------------------------------------------------
+            # NO-OVERWRITE transaction.
+            #
+            # os.replace() is deliberately NOT used here:
+            # it could overwrite a destination that appeared
+            # concurrently.
+            #
+            # os.link() fails atomically if destination exists.
+            # The second step removes the original path.
+            # APPLY_STARTED makes the two-step transaction
+            # crash-recoverable.
+            # ------------------------------------------------
+
+            os.link(
+                source,
+                destination,
+            )
+
+            destination_linked = True
+            _fsync_directory(destination.parent)
+
+            if not os.path.samefile(
+                source,
+                destination,
+            ):
+                raise OSError(
+                    "Relocation destination inode mismatch"
+                )
+
+            if _sha256_file(destination) != expected_sha256:
+                raise OSError(
+                    "Relocation destination SHA mismatch "
+                    "before source removal"
+                )
+
+            os.unlink(source)
+            source_removed = True
+
+            _fsync_directory(source.parent)
+
+            actual_after_sha256 = (
+                self._verify_relocation_target(
+                    source,
+                    destination,
+                    expected_sha256,
+                )
+            )
+
+        except ProposalConflictError:
+            raise
+
+        except FileExistsError:
+            if not destination_linked:
+                self._raise_relocation_stale(
+                    payload,
+                    (
+                        "Relocation destination appeared "
+                        "immediately before execution"
+                    ),
+                )
+            raise
+
+        except Exception as exc:
+            rollback_ok = False
+            rollback_error: str | None = None
+
+            if destination_linked:
+                try:
+                    source_exists = source.exists()
+                    destination_exists = (
+                        destination.exists()
+                    )
+
+                    if (
+                        source_exists
+                        and destination_exists
+                    ):
+                        if not os.path.samefile(
+                            source,
+                            destination,
+                        ):
+                            raise OSError(
+                                "Rollback refused: source path "
+                                "is occupied by another file"
+                            )
+
+                        # Source still exists: just remove the
+                        # transaction-created destination link.
+                        os.unlink(destination)
+                        _fsync_directory(
+                            destination.parent
+                        )
+
+                    elif (
+                        not source_exists
+                        and destination_exists
+                    ):
+                        # Source was already removed. Restore it
+                        # without overwriting anything.
+                        os.link(
+                            destination,
+                            source,
+                        )
+                        _fsync_directory(source.parent)
+
+                        os.unlink(destination)
+                        _fsync_directory(
+                            destination.parent
+                        )
+
+                    else:
+                        raise OSError(
+                            "Rollback state is inconsistent"
+                        )
+
+                    if (
+                        not source.exists()
+                        or not source.is_file()
+                        or _sha256_file(source)
+                        != expected_sha256
+                        or destination.exists()
+                    ):
+                        raise OSError(
+                            "Relocation rollback verification "
+                            "failed"
+                        )
+
+                    rollback_ok = True
+
+                except Exception as rollback_exc:
+                    rollback_error = (
+                        f"{type(rollback_exc).__name__}: "
+                        f"{rollback_exc}"
+                    )
+
+            else:
+                rollback_ok = True
+
+            now = _utc_now()
+
+            if destination_linked:
+                status = (
+                    "ROLLED_BACK"
+                    if rollback_ok
+                    else "ROLLBACK_FAILED"
+                )
+            else:
+                status = "APPLY_FAILED"
+
+            reason = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            payload["status"] = status
+            payload["updated_at"] = now
+            payload["apply_error"] = reason
+            payload["workspace_write_performed"] = (
+                destination_linked
+                or source_removed
+            )
+            payload["workspace_state_restored"] = (
+                rollback_ok
+            )
+
+            if rollback_error:
+                payload["rollback_error"] = (
+                    rollback_error
+                )
+
+            history.append(
+                self._event(
+                    status,
+                    reason=reason,
+                )
+            )
+
+            self._save(payload)
+
+            raise ProposalApplyError(
+                (
+                    "Relocation failed; workspace "
+                    "was restored"
+                    if rollback_ok
+                    else
+                    "Relocation failed and rollback "
+                    "could not be verified"
+                ),
+                self._public(payload),
+            ) from exc
+
+        now = _utc_now()
+
+        payload["status"] = "APPLIED"
+        payload["applied_at"] = now
+        payload["updated_at"] = now
+        payload["workspace_write_performed"] = True
+        payload["workspace_state_restored"] = False
+        payload["applied_sha256"] = (
+            actual_after_sha256
+        )
+        payload["applied_path"] = payload[
+            "destination_path"
+        ]
+        payload["recovered_after_restart"] = False
+
+        history.append(
+            self._event("APPLIED")
+        )
+
+        self._save(payload)
+
+        return self._public(payload)
 
     def _verify_applied_target(
         self,
@@ -486,6 +1129,12 @@ class ChangeProposalStore:
                 raise ProposalStateError(
                     "Only APPROVED proposals can be applied"
                 )
+
+            if (
+                payload.get("operation")
+                in _RELOCATION_OPERATIONS
+            ):
+                return self._apply_relocation(payload)
 
             workspace_id = str(payload["workspace_id"])
             relative = str(payload["path"])

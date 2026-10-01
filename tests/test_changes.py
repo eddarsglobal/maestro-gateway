@@ -438,5 +438,356 @@ class ChangeProposalTests(unittest.TestCase):
             )
 
 
+    def test_rename_proposal_and_approval_do_not_move(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            source = root / "old.txt"
+            destination = root / "new.txt"
+
+            source.write_text(
+                "rename me\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="old.txt",
+                destination="new.txt",
+                operation="rename",
+            )
+
+            self.assertEqual(
+                proposal["protocol"],
+                "P0.6C.1",
+            )
+
+            self.assertEqual(
+                proposal["status"],
+                "AWAITING_APPROVAL",
+            )
+
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+
+            approved = changes.approve(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                approved["status"],
+                "APPROVED",
+            )
+
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+
+    def test_approved_rename_is_applied(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            source = root / "old.txt"
+            destination = root / "new.txt"
+
+            source.write_text(
+                "rename me\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="old.txt",
+                destination="new.txt",
+                operation="rename",
+            )
+
+            changes.approve(
+                proposal["id"]
+            )
+
+            applied = changes.apply(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                applied["status"],
+                "APPLIED",
+            )
+
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.exists())
+
+            self.assertEqual(
+                destination.read_text(
+                    encoding="utf-8"
+                ),
+                "rename me\n",
+            )
+
+            self.assertEqual(
+                applied["applied_sha256"],
+                applied["after_sha256"],
+            )
+
+            self.assertEqual(
+                applied["applied_path"],
+                "new.txt",
+            )
+
+    def test_approved_move_is_applied(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            (root / "archive").mkdir()
+
+            source = root / "move.txt"
+            destination = (
+                root / "archive" / "move.txt"
+            )
+
+            source.write_text(
+                "move me\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="move.txt",
+                destination="archive/move.txt",
+                operation="move",
+            )
+
+            changes.approve(
+                proposal["id"]
+            )
+
+            applied = changes.apply(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                applied["status"],
+                "APPLIED",
+            )
+
+            self.assertFalse(source.exists())
+            self.assertEqual(
+                destination.read_text(
+                    encoding="utf-8"
+                ),
+                "move me\n",
+            )
+
+    def test_rename_must_remain_in_same_parent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            (root / "archive").mkdir()
+
+            source = root / "old.txt"
+            source.write_text(
+                "x\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                changes.propose(
+                    workspace_id=row["id"],
+                    relative="old.txt",
+                    destination="archive/new.txt",
+                    operation="rename",
+                )
+
+    def test_relocation_destination_collision_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            source = root / "old.txt"
+            destination = root / "new.txt"
+
+            source.write_text(
+                "source\n",
+                encoding="utf-8",
+            )
+
+            destination.write_text(
+                "existing\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(
+                FileExistsError
+            ):
+                changes.propose(
+                    workspace_id=row["id"],
+                    relative="old.txt",
+                    destination="new.txt",
+                    operation="rename",
+                )
+
+            self.assertEqual(
+                destination.read_text(
+                    encoding="utf-8"
+                ),
+                "existing\n",
+            )
+
+    def test_destination_created_after_approval_makes_move_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            source = root / "old.txt"
+            destination = root / "new.txt"
+
+            source.write_text(
+                "source\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="old.txt",
+                destination="new.txt",
+                operation="rename",
+            )
+
+            changes.approve(
+                proposal["id"]
+            )
+
+            destination.write_text(
+                "external\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(
+                ProposalConflictError
+            ):
+                changes.apply(
+                    proposal["id"]
+                )
+
+            self.assertEqual(
+                changes.get(
+                    proposal["id"]
+                )["status"],
+                "STALE",
+            )
+
+            self.assertTrue(source.exists())
+
+            self.assertEqual(
+                destination.read_text(
+                    encoding="utf-8"
+                ),
+                "external\n",
+            )
+
+    def test_source_changed_after_approval_makes_move_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            source = root / "old.txt"
+
+            source.write_text(
+                "v1\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="old.txt",
+                destination="new.txt",
+                operation="rename",
+            )
+
+            changes.approve(
+                proposal["id"]
+            )
+
+            source.write_text(
+                "external-change\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(
+                ProposalConflictError
+            ):
+                changes.apply(
+                    proposal["id"]
+                )
+
+            self.assertEqual(
+                changes.get(
+                    proposal["id"]
+                )["status"],
+                "STALE",
+            )
+
+            self.assertFalse(
+                (root / "new.txt").exists()
+            )
+
+    def test_relocation_verification_failure_rolls_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, row, changes = self.make_store(td)
+
+            source = root / "old.txt"
+            destination = root / "new.txt"
+
+            source.write_text(
+                "before\n",
+                encoding="utf-8",
+            )
+
+            proposal = changes.propose(
+                workspace_id=row["id"],
+                relative="old.txt",
+                destination="new.txt",
+                operation="rename",
+            )
+
+            changes.approve(
+                proposal["id"]
+            )
+
+            with mock.patch.object(
+                changes,
+                "_verify_relocation_target",
+                side_effect=OSError(
+                    "forced relocation verification failure"
+                ),
+            ):
+                with self.assertRaises(
+                    ProposalApplyError
+                ):
+                    changes.apply(
+                        proposal["id"]
+                    )
+
+            final = changes.get(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                final["status"],
+                "ROLLED_BACK",
+            )
+
+            self.assertTrue(
+                final["workspace_state_restored"]
+            )
+
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+
+            self.assertEqual(
+                source.read_text(
+                    encoding="utf-8"
+                ),
+                "before\n",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

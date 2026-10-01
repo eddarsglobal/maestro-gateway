@@ -378,7 +378,7 @@ class WorkspaceRegistry:
         parent = target.parent
         if not parent.exists() or not parent.is_dir():
             raise ValueError(
-                "Parent directory must already exist in P0.6B.3"
+                "Parent directory must already exist in P0.6C.1"
             )
 
         if target.exists() and target.is_dir():
@@ -390,6 +390,77 @@ class WorkspaceRegistry:
             "path": display,
             "absolute_path": str(target),
             "exists": target.exists(),
+        }
+
+    def resolve_relocation_targets(
+        self,
+        workspace_id: str,
+        source_relative: str,
+        destination_relative: str,
+        operation: str,
+    ) -> dict[str, Any]:
+        """Resolve one governed rename/move pair.
+
+        P0.6C.1 is file-only. Both paths must remain inside the
+        same authorized workspace and on the same filesystem.
+        """
+
+        op = str(operation or "").strip().lower()
+
+        if op not in {"rename", "move"}:
+            raise ValueError(
+                "Relocation operation must be rename or move"
+            )
+
+        source_info = self.resolve_change_target(
+            workspace_id,
+            source_relative,
+        )
+
+        destination_info = self.resolve_change_target(
+            workspace_id,
+            destination_relative,
+        )
+
+        source = Path(
+            str(source_info["absolute_path"])
+        )
+
+        destination = Path(
+            str(destination_info["absolute_path"])
+        )
+
+        if source == destination:
+            raise ValueError(
+                "Source and destination must be different"
+            )
+
+        if op == "rename" and source.parent != destination.parent:
+            raise ValueError(
+                "rename must remain in the same parent directory; "
+                "use move for a different directory"
+            )
+
+        # Parents are guaranteed to exist by resolve_change_target().
+        if (
+            source.parent.stat().st_dev
+            != destination.parent.stat().st_dev
+        ):
+            raise ValueError(
+                "Cross-filesystem relocation is not supported "
+                "in P0.6C.1"
+            )
+
+        return {
+            "workspace_id": source_info["workspace_id"],
+            "workspace_label": source_info["workspace_label"],
+            "operation": op,
+            "source_path": source_info["path"],
+            "source_absolute_path": source_info["absolute_path"],
+            "destination_path": destination_info["path"],
+            "destination_absolute_path": (
+                destination_info["absolute_path"]
+            ),
         }
 
     def tree(

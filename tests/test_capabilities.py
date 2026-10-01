@@ -52,12 +52,28 @@ class CapabilityRegistryTests(unittest.TestCase):
                 "available_requires_workspace",
             )
 
+    def test_rename_and_move_are_governed(self):
+        index = self.index(workspace_active=True)
+
+        for capability_id in (
+            "filesystem.rename",
+            "filesystem.move",
+        ):
+            self.assertEqual(
+                index[capability_id]["status"],
+                "available_governed_requires_user_approval",
+            )
+            self.assertEqual(
+                index[capability_id]["approval"],
+                "user",
+            )
+
     def test_delete_remains_disabled(self):
         index = self.index(workspace_active=True)
 
         self.assertEqual(
             index["filesystem.delete"]["status"],
-            "not_available_p0_6b3",
+            "not_available_p0_6c1",
         )
 
 

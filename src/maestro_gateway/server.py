@@ -424,14 +424,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "P0.6A"
                     ),
                     "change_protocol": (
-                        "P0.6B.3"
+                        "P0.6C.1"
                     ),
                     "workspace_write_execution": True,
                     "conversation_storage": (
                         "local"
                     ),
                     "workspace": (
-                        "governed_atomic_write"
+                        "governed_atomic_mutation"
                     ),
                     "native_workspace_picker": (
                         "macos" if sys.platform == "darwin" else "unsupported"
@@ -484,14 +484,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "P0.6A"
                     ),
                     "change_protocol": (
-                        "P0.6B.3"
+                        "P0.6C.1"
                     ),
                     "workspace_write_execution": True,
                     "conversation_storage": (
                         "local"
                     ),
                     "workspace": (
-                        "governed_atomic_write"
+                        "governed_atomic_mutation"
                     ),
                     "native_workspace_picker": (
                         "macos" if sys.platform == "darwin" else "unsupported"
@@ -902,6 +902,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         operation=str(
                             payload.get("operation") or "edit"
                         ),
+                        destination=str(
+                            payload.get("destination") or ""
+                        ),
                     )
                 )
             except KeyError as exc:
@@ -917,6 +920,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 ValueError,
                 PermissionError,
                 FileNotFoundError,
+                FileExistsError,
                 UnicodeDecodeError,
             ) as exc:
                 self._send_json(
@@ -1473,7 +1477,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6B.3"
+        "MAESTRO LOCAL GATEWAY — P0.6C.1"
     )
     print("=" * 72)
     print(
@@ -1484,7 +1488,7 @@ def main() -> int:
         f"Runtime : {config.runtime_dir}"
     )
     print(
-        "Workspace: governed read + atomic governed writes"
+        "Workspace: governed read + governed writes + relocation"
     )
     print(
         "Quality : anti-echo + recoverable tool guard enabled"
@@ -1493,10 +1497,10 @@ def main() -> int:
         "Picker  : macOS native file/folder chooser"
     )
     print(
-        "Changes : diff + SHA-256 + approval + separate atomic apply"
+        "Changes : write/edit/patch + governed rename/move"
     )
     print(
-        "Write   : explicit approval + governed atomic apply ENABLED"
+        "Mutate  : APPROVE != APPLY; NO-OVERWRITE relocation ENABLED"
     )
     print("=" * 72)
 
