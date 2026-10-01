@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maestro-local-gateway"
+version = "0.1.0"
+description = "Secure localhost bridge between MAESTRO UI and MAESTRO Core."
+requires-python = ">=3.11"
+authors = [{ name = "EddarsGlobal" }]
+dependencies = []
+
+[project.scripts]
+maestro-gateway = "maestro_gateway.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
