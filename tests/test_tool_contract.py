@@ -50,5 +50,44 @@ class ToolContractTests(unittest.TestCase):
         self.assertEqual(args["max_depth"], 6)
 
 
+    def test_terminal_normalizes_arguments(self):
+        args = _normalize_tool_arguments(
+            "terminal.run",
+            {
+                "argv": ["pwd"],
+                "cwd": ".",
+                "timeout_ms": 2500,
+            },
+        )
+
+        self.assertEqual(
+            args,
+            {
+                "argv": ["pwd"],
+                "cwd": ".",
+                "timeout_ms": 2500,
+            },
+        )
+
+    def test_terminal_requires_argv_list(self):
+        with self.assertRaises(ValueError):
+            _normalize_tool_arguments(
+                "terminal.run",
+                {
+                    "argv": "pwd",
+                },
+            )
+
+    def test_terminal_timeout_is_strictly_bounded(self):
+        with self.assertRaises(ValueError):
+            _normalize_tool_arguments(
+                "terminal.run",
+                {
+                    "argv": ["pwd"],
+                    "timeout_ms": 6000,
+                },
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

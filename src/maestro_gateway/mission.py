@@ -262,8 +262,97 @@ def _normalize_tool_arguments(
             "max_depth": max(0, min(max_depth, 6)),
         }
 
+    if name == "terminal.run":
+        raw_argv = arguments.get("argv")
+
+        if (
+            not isinstance(raw_argv, list)
+            or not raw_argv
+        ):
+            raise ValueError(
+                "terminal.run requires a non-empty argv list"
+            )
+
+        if len(raw_argv) > 8:
+            raise ValueError(
+                "terminal.run accepts at most 8 argv items"
+            )
+
+        argv: list[str] = []
+
+        for item in raw_argv:
+            if not isinstance(item, str):
+                raise ValueError(
+                    "terminal.run argv items must be strings"
+                )
+
+            value = item.strip()
+
+            if (
+                not value
+                or "\x00" in value
+            ):
+                raise ValueError(
+                    "terminal.run argv items must be non-empty strings"
+                )
+
+            if len(value) > 256:
+                raise ValueError(
+                    "terminal.run argv item exceeds size limit"
+                )
+
+            argv.append(value)
+
+        cwd = str(
+            arguments.get("cwd") or "."
+        ).strip()
+
+        if (
+            not cwd
+            or "\x00" in cwd
+        ):
+            raise ValueError(
+                "terminal.run cwd must be a relative workspace path"
+            )
+
+        raw_timeout = arguments.get(
+            "timeout_ms",
+            3000,
+        )
+
+        if isinstance(
+            raw_timeout,
+            bool,
+        ):
+            raise ValueError(
+                "terminal.run timeout_ms must be an integer"
+            )
+
+        try:
+            timeout_ms = int(
+                raw_timeout
+            )
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ValueError(
+                "terminal.run timeout_ms must be an integer"
+            ) from exc
+
+        if not 100 <= timeout_ms <= 5000:
+            raise ValueError(
+                "terminal.run timeout_ms must be between 100 and 5000"
+            )
+
+        return {
+            "argv": argv,
+            "cwd": cwd,
+            "timeout_ms": timeout_ms,
+        }
+
     raise ValueError(
-        f"Tool is not available in P0.6A: {name}"
+        f"Tool is not available in P0.6D.1: {name}"
     )
 
 
@@ -505,7 +594,12 @@ class GovernedDirectMissionRunner:
                 self._capabilities.prompt_summary(
                     workspace_active=bool(
                         active_workspace
-                    )
+                    ),
+                    workspace_kind=(
+                        str(active_workspace["kind"])
+                        if active_workspace
+                        else None
+                    ),
                 )
             )
 
@@ -545,6 +639,12 @@ class GovernedDirectMissionRunner:
                     'Example for package.json: {"path":"package.json"}.\n'
                     "- workspace.search: "
                     '{"query":"text"}\n'
+                    "- terminal.run (P0.6D.1 inspection-only): "
+                    '{"argv":["pwd"],"cwd":".","timeout_ms":3000}\n'
+                    "  Allowed terminal commands: pwd, head, tail, wc, stat. "
+                    "No shell, pipes, redirects, Git, interpreters, package "
+                    "managers, network commands, or mutating commands. "
+                    "Use workspace.tree for directory listings.\n"
                     "\nIf you do not yet know the exact file path, use "
                     "workspace.tree or workspace.search first. "
                     "When you need workspace data, "
@@ -556,8 +656,9 @@ class GovernedDirectMissionRunner:
                     "</MAESTRO_TOOL>\n"
                     "MAESTRO executes the tool and returns "
                     "the result. Never invent a tool result. "
-                    "P0.6A is READ-ONLY: write/edit/delete "
-                    "are not available."
+                    "Mission tools are inspection-only in P0.6D.1: "
+                    "write/edit/delete and mutating terminal commands "
+                    "are not available through this tool channel."
                 )
 
             context_block = (
@@ -738,6 +839,26 @@ class GovernedDirectMissionRunner:
                             )
 
                             attempt["ok"] = True
+
+                            if isinstance(
+                                tool_result,
+                                dict,
+                            ):
+                                execution_evidence = (
+                                    tool_result.get(
+                                        "execution_evidence"
+                                    )
+                                )
+
+                                if isinstance(
+                                    execution_evidence,
+                                    dict,
+                                ):
+                                    attempt[
+                                        "execution_evidence"
+                                    ] = (
+                                        execution_evidence
+                                    )
 
                             transcript += (
                                 "\n\nMAESTRO TOOL REQUEST:\n"

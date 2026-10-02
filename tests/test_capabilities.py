@@ -4,9 +4,18 @@ from maestro_gateway.capabilities import CapabilityRegistry
 
 
 class CapabilityRegistryTests(unittest.TestCase):
-    def index(self, *, workspace_active: bool):
+    def index(
+        self,
+        *,
+        workspace_active: bool,
+        workspace_kind: str | None = None,
+    ):
+        if workspace_active and workspace_kind is None:
+            workspace_kind = "directory"
+
         rows = CapabilityRegistry().snapshot(
-            workspace_active=workspace_active
+            workspace_active=workspace_active,
+            workspace_kind=workspace_kind,
         )
         return {
             row["capability_id"]: row
@@ -79,4 +88,41 @@ class CapabilityRegistryTests(unittest.TestCase):
         self.assertEqual(
             index["filesystem.delete"]["approval"],
             "user",
+        )
+
+    def test_terminal_is_inspection_only_with_workspace(self):
+        index = self.index(
+            workspace_active=True
+        )
+
+        self.assertEqual(
+            index["terminal.run"]["status"],
+            "available_inspection_only_in_authorized_workspace",
+        )
+
+        self.assertEqual(
+            index["terminal.run"]["approval"],
+            "workspace_authorization",
+        )
+
+    def test_terminal_requires_workspace(self):
+        index = self.index(
+            workspace_active=False
+        )
+
+        self.assertEqual(
+            index["terminal.run"]["status"],
+            "available_requires_workspace",
+        )
+
+
+    def test_terminal_rejects_file_workspace_capability(self):
+        index = self.index(
+            workspace_active=True,
+            workspace_kind="file",
+        )
+
+        self.assertEqual(
+            index["terminal.run"]["status"],
+            "not_available_requires_directory_workspace",
         )

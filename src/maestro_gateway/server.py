@@ -23,6 +23,11 @@ from .conversations import ConversationStore
 from .core import MaestroCoreBridge
 from .mission import GovernedDirectMissionRunner
 from .ollama import discover_ollama
+from .terminal import (
+    TERMINAL_MODE,
+    TERMINAL_PROTOCOL,
+    TERMINAL_SHELL,
+)
 from .workspace import WorkspaceRegistry
 
 
@@ -428,6 +433,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     ),
                     "workspace_write_execution": True,
                     "workspace_delete_execution": True,
+                    "terminal_protocol": TERMINAL_PROTOCOL,
+                    "terminal_execution": TERMINAL_MODE,
+                    "terminal_shell": TERMINAL_SHELL,
                     "conversation_storage": (
                         "local"
                     ),
@@ -489,6 +497,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     ),
                     "workspace_write_execution": True,
                     "workspace_delete_execution": True,
+                    "terminal_protocol": TERMINAL_PROTOCOL,
+                    "terminal_execution": TERMINAL_MODE,
+                    "terminal_shell": TERMINAL_SHELL,
                     "conversation_storage": (
                         "local"
                     ),
@@ -506,12 +517,36 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not self._require_session():
                 return
 
-            active = bool(
+            workspace_id = str(
                 query.get(
                     "workspace_id",
                     [""],
                 )[0]
-            )
+                or ""
+            ).strip()
+
+            active = False
+            workspace_kind = None
+
+            if workspace_id:
+                try:
+                    workspace_row = (
+                        self.server.workspaces.get(
+                            workspace_id
+                        )
+                    )
+                except KeyError:
+                    workspace_row = None
+
+                if (
+                    workspace_row
+                    and workspace_row.get("exists")
+                ):
+                    active = True
+                    workspace_kind = str(
+                        workspace_row.get("kind")
+                        or ""
+                    )
 
             self._send_json(
                 HTTPStatus.OK,
@@ -520,7 +555,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         self.server
                         .capabilities
                         .snapshot(
-                            workspace_active=active
+                            workspace_active=active,
+                            workspace_kind=workspace_kind,
                         )
                     )
                 },
@@ -1484,7 +1520,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6C.2"
+        "MAESTRO LOCAL GATEWAY — P0.6D.1"
     )
     print("=" * 72)
     print(

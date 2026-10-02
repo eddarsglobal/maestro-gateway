@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .terminal import run_inspection_command
+
 
 MAX_READ_BYTES = 1_048_576
 MAX_TOOL_CHARS = 32_000
@@ -725,6 +727,45 @@ class WorkspaceRegistry:
             ),
         }
 
+    def run_terminal(
+        self,
+        workspace_id: str,
+        *,
+        argv: Any,
+        cwd: str = ".",
+        timeout_ms: Any = 3000,
+    ) -> dict[str, Any]:
+        row, selected = self._scope(
+            workspace_id
+        )
+
+        if row["kind"] != "directory":
+            raise ValueError(
+                "terminal.run requires an authorized directory workspace"
+            )
+
+        workdir = self._resolve_relative(
+            workspace_id,
+            cwd,
+        )
+
+        if not workdir.is_dir():
+            raise ValueError(
+                "terminal.run cwd must be a directory"
+            )
+
+        result = run_inspection_command(
+            workspace_root=selected,
+            cwd=workdir,
+            argv=argv,
+            timeout_ms=timeout_ms,
+        )
+
+        return {
+            "workspace_id": row["id"],
+            **result,
+        }
+
     def execute_tool(
         self,
         workspace_id: str,
@@ -755,6 +796,19 @@ class WorkspaceRegistry:
                 workspace_id,
                 query=str(
                     arguments.get("query") or ""
+                ),
+            )
+
+        if name == "terminal.run":
+            return self.run_terminal(
+                workspace_id,
+                argv=arguments.get("argv"),
+                cwd=str(
+                    arguments.get("cwd") or "."
+                ),
+                timeout_ms=arguments.get(
+                    "timeout_ms",
+                    3000,
                 ),
             )
 

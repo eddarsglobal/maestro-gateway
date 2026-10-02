@@ -28,6 +28,7 @@ class CapabilityRegistry:
         self,
         *,
         workspace_active: bool = False,
+        workspace_kind: str | None = None,
     ) -> list[dict[str, Any]]:
         workspace_state = (
             "available_in_authorized_workspace"
@@ -40,6 +41,17 @@ class CapabilityRegistry:
             if workspace_active
             else "available_requires_workspace"
         )
+
+        if not workspace_active:
+            terminal_state = "available_requires_workspace"
+        elif workspace_kind == "directory":
+            terminal_state = (
+                "available_inspection_only_in_authorized_workspace"
+            )
+        else:
+            terminal_state = (
+                "not_available_requires_directory_workspace"
+            )
 
         capabilities = [
             Capability(
@@ -124,9 +136,9 @@ class CapabilityRegistry:
             Capability(
                 "terminal.run",
                 "development",
-                "not_available_p0_6c2",
-                "Terminal execution is planned for a later governed stage.",
-                approval="future_sandbox",
+                terminal_state,
+                "Run allowlisted, non-interactive, read-only inspection commands inside an authorized directory workspace.",
+                approval="workspace_authorization",
             ),
             Capability(
                 "git.execute",
@@ -150,6 +162,7 @@ class CapabilityRegistry:
         self,
         *,
         workspace_active: bool = False,
+        workspace_kind: str | None = None,
     ) -> str:
         rows = [
             "MAESTRO CAPABILITY SNAPSHOT",
@@ -160,7 +173,8 @@ class CapabilityRegistry:
         ]
 
         for item in self.snapshot(
-            workspace_active=workspace_active
+            workspace_active=workspace_active,
+            workspace_kind=workspace_kind,
         ):
             rows.append(
                 f"- {item['capability_id']}: {item['status']}"
