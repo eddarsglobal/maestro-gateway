@@ -6,9 +6,12 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import stat
+import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,7 +19,16 @@ from typing import Any
 from .workspace import WorkspaceRegistry
 
 
-EXECUTION_PROTOCOL = "P0.6D.2A"
+EXECUTION_PROTOCOL = "P0.6D.2B"
+
+MAX_EXECUTION_OUTPUT_BYTES = 64_000
+
+PROFILE_TIMEOUT_MS = {
+    "python_unittest": 60_000,
+    "node_npm_build": 120_000,
+    "node_npm_lint": 60_000,
+    "node_npm_test": 120_000,
+}
 
 _RUN_ID = re.compile(
     r"^RUN-[A-F0-9]{12}$"
@@ -316,6 +328,11 @@ class ExecutionProfileDetector:
                         "tests",
                         "-v",
                     ],
+                    "timeout_ms": (
+                        PROFILE_TIMEOUT_MS[
+                            "python_unittest"
+                        ]
+                    ),
                     "project_code_execution": True,
                     "outer_shell": False,
                     "network_isolation": False,
@@ -401,6 +418,11 @@ class ExecutionProfileDetector:
                         ],
                         "project_script": (
                             script
+                        ),
+                        "timeout_ms": (
+                            PROFILE_TIMEOUT_MS[
+                                profile_name
+                            ]
                         ),
                         "project_code_execution": True,
                         "outer_shell": False,
@@ -628,6 +650,311 @@ class ExecutionProfileDetector:
                 "protected_directories"
             ),
         }
+
+
+class _BoundedStreamCollector:
+    def __init__(
+        self,
+        limit: int,
+    ):
+        self.limit = int(limit)
+        self.total_bytes = 0
+        self.buffer = bytearray()
+        self.digest = hashlib.sha256()
+        self.error: str | None = None
+
+    def consume(
+        self,
+        stream: Any,
+    ) -> None:
+        try:
+            while True:
+                block = stream.read(
+                    64 * 1024
+                )
+
+                if not block:
+                    break
+
+                self.total_bytes += len(
+                    block
+                )
+
+                self.digest.update(
+                    block
+                )
+
+                remaining = (
+                    self.limit
+                    - len(self.buffer)
+                )
+
+                if remaining > 0:
+                    self.buffer.extend(
+                        block[:remaining]
+                    )
+
+        except Exception as exc:
+            self.error = (
+                f"{type(exc).__name__}: "
+                f"{exc}"
+            )
+
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def result(
+        self,
+    ) -> dict[str, Any]:
+        return {
+            "text": bytes(
+                self.buffer
+            ).decode(
+                "utf-8",
+                errors="replace",
+            ),
+            "sha256": (
+                self.digest.hexdigest()
+            ),
+            "bytes": (
+                self.total_bytes
+            ),
+            "truncated": (
+                self.total_bytes
+                > self.limit
+            ),
+            "reader_error": (
+                self.error
+            ),
+        }
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes],
+) -> bool:
+    terminated = False
+
+    if process.poll() is not None:
+        return terminated
+
+    try:
+        if os.name == "posix":
+            os.killpg(
+                process.pid,
+                signal.SIGTERM,
+            )
+        else:
+            process.terminate()
+
+        terminated = True
+
+    except (
+        ProcessLookupError,
+        PermissionError,
+    ):
+        pass
+
+    try:
+        process.wait(
+            timeout=0.75
+        )
+        return terminated
+
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        if os.name == "posix":
+            os.killpg(
+                process.pid,
+                signal.SIGKILL,
+            )
+        else:
+            process.kill()
+
+        terminated = True
+
+    except (
+        ProcessLookupError,
+        PermissionError,
+    ):
+        pass
+
+    try:
+        process.wait(
+            timeout=2.0
+        )
+    except subprocess.TimeoutExpired:
+        pass
+
+    return terminated
+
+
+def _run_bounded_process(
+    *,
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    timeout_ms: int,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+
+    process = subprocess.Popen(
+        argv,
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        close_fds=True,
+        start_new_session=True,
+    )
+
+    if (
+        process.stdout is None
+        or process.stderr is None
+    ):
+        raise RuntimeError(
+            "Execution pipes were not created"
+        )
+
+    stdout_collector = (
+        _BoundedStreamCollector(
+            MAX_EXECUTION_OUTPUT_BYTES
+        )
+    )
+
+    stderr_collector = (
+        _BoundedStreamCollector(
+            MAX_EXECUTION_OUTPUT_BYTES
+        )
+    )
+
+    stdout_thread = threading.Thread(
+        target=(
+            stdout_collector.consume
+        ),
+        args=(process.stdout,),
+        daemon=True,
+    )
+
+    stderr_thread = threading.Thread(
+        target=(
+            stderr_collector.consume
+        ),
+        args=(process.stderr,),
+        daemon=True,
+    )
+
+    stdout_thread.start()
+    stderr_thread.start()
+
+    timed_out = False
+    group_terminated = False
+
+    try:
+        process.wait(
+            timeout=(
+                timeout_ms
+                / 1000.0
+            )
+        )
+
+    except subprocess.TimeoutExpired:
+        timed_out = True
+
+        group_terminated = (
+            _terminate_process_group(
+                process
+            )
+        )
+
+    stdout_thread.join(
+        timeout=3.0
+    )
+
+    stderr_thread.join(
+        timeout=3.0
+    )
+
+    if (
+        stdout_thread.is_alive()
+        or stderr_thread.is_alive()
+    ):
+        group_terminated = (
+            _terminate_process_group(
+                process
+            )
+            or group_terminated
+        )
+
+        stdout_thread.join(
+            timeout=1.0
+        )
+
+        stderr_thread.join(
+            timeout=1.0
+        )
+
+    stdout = (
+        stdout_collector.result()
+    )
+
+    stderr = (
+        stderr_collector.result()
+    )
+
+    duration_ms = int(
+        (
+            time.perf_counter()
+            - started
+        )
+        * 1000
+    )
+
+    return {
+        "exit_code": (
+            process.returncode
+        ),
+        "timed_out": timed_out,
+        "process_group_terminated": (
+            group_terminated
+        ),
+        "duration_ms": (
+            duration_ms
+        ),
+        "stdout": stdout["text"],
+        "stderr": stderr["text"],
+        "stdout_sha256": (
+            stdout["sha256"]
+        ),
+        "stderr_sha256": (
+            stderr["sha256"]
+        ),
+        "stdout_bytes": (
+            stdout["bytes"]
+        ),
+        "stderr_bytes": (
+            stderr["bytes"]
+        ),
+        "stdout_truncated": (
+            stdout["truncated"]
+        ),
+        "stderr_truncated": (
+            stderr["truncated"]
+        ),
+        "stdout_reader_error": (
+            stdout["reader_error"]
+        ),
+        "stderr_reader_error": (
+            stderr["reader_error"]
+        ),
+    }
+
 
 
 class ExecutionProposalStore:
@@ -878,6 +1205,11 @@ class ExecutionProposalStore:
                         "project_script"
                     )
                 ),
+                "timeout_ms": int(
+                    definition[
+                        "timeout_ms"
+                    ]
+                ),
                 "project_code_execution": (
                     True
                 ),
@@ -1007,6 +1339,16 @@ class ExecutionProposalStore:
                 != payload.get(
                     "project_script"
                 )
+                or int(
+                    definition[
+                        "timeout_ms"
+                    ]
+                )
+                != int(
+                    payload[
+                        "timeout_ms"
+                    ]
+                )
                 or snapshot[
                     "workspace_sha256"
                 ]
@@ -1048,6 +1390,641 @@ class ExecutionProposalStore:
             payload["history"].append(
                 self._event(
                     "APPROVED"
+                )
+            )
+
+            self._save(payload)
+
+            return dict(payload)
+
+    def _execution_environment(
+        self,
+        run_id: str,
+        executable: str,
+    ) -> tuple[
+        dict[str, str],
+        Path,
+    ]:
+        runtime = (
+            self.root
+            / "_runtime"
+            / run_id
+        )
+
+        home = runtime / "home"
+        temporary = runtime / "tmp"
+        npm_cache = (
+            runtime / "npm-cache"
+        )
+
+        for directory in (
+            runtime,
+            home,
+            temporary,
+            npm_cache,
+        ):
+            directory.mkdir(
+                parents=True,
+                exist_ok=True,
+                mode=0o700,
+            )
+
+            os.chmod(
+                directory,
+                0o700,
+            )
+
+        npmrc = runtime / "npmrc"
+
+        if not npmrc.exists():
+            npmrc.write_text(
+                "",
+                encoding="utf-8",
+            )
+
+        os.chmod(
+            npmrc,
+            0o600,
+        )
+
+        executable_path = Path(
+            executable
+        ).expanduser()
+
+        executable_parent = str(
+            executable_path.parent
+        )
+
+        resolved_executable_parent = str(
+            executable_path.resolve().parent
+        )
+
+        path_entries: list[str] = []
+
+        for value in (
+            executable_parent,
+            resolved_executable_parent,
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ):
+            if (
+                value
+                and value
+                not in path_entries
+            ):
+                path_entries.append(
+                    value
+                )
+
+        environment = {
+            "PATH": ":".join(
+                path_entries
+            ),
+            "HOME": str(home),
+            "TMPDIR": str(
+                temporary
+            ),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "TZ": "UTC",
+            "CI": "1",
+            "NO_COLOR": "1",
+            "PYTHONNOUSERSITE": "1",
+            "PIP_CONFIG_FILE": (
+                "/dev/null"
+            ),
+            "npm_config_userconfig": (
+                str(npmrc)
+            ),
+            "npm_config_cache": (
+                str(npm_cache)
+            ),
+            "npm_config_update_notifier": (
+                "false"
+            ),
+            "npm_config_fund": "false",
+            "npm_config_audit": "false",
+        }
+
+        return (
+            environment,
+            runtime,
+        )
+
+    def _execution_stale_check(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+    ]:
+        try:
+            definition = (
+                self._detector
+                .resolve_profile(
+                    payload[
+                        "workspace_id"
+                    ],
+                    payload[
+                        "profile"
+                    ],
+                    payload[
+                        "kind"
+                    ],
+                )
+            )
+
+            snapshot = (
+                self._detector
+                .snapshot(
+                    payload[
+                        "workspace_id"
+                    ]
+                )
+            )
+
+        except (
+            ValueError,
+            PermissionError,
+            FileNotFoundError,
+        ) as exc:
+            stale = (
+                self._mark_stale(
+                    payload,
+                    str(exc),
+                )
+            )
+
+            raise ExecutionStaleError(
+                str(exc),
+                stale,
+            ) from exc
+
+        if (
+            definition[
+                "planned_argv"
+            ]
+            != payload[
+                "planned_argv"
+            ]
+            or definition.get(
+                "project_script"
+            )
+            != payload.get(
+                "project_script"
+            )
+            or int(
+                definition[
+                    "timeout_ms"
+                ]
+            )
+            != int(
+                payload[
+                    "timeout_ms"
+                ]
+            )
+            or snapshot[
+                "workspace_sha256"
+            ]
+            != payload[
+                "workspace_sha256"
+            ]
+        ):
+            reason = (
+                "Execution profile or "
+                "workspace changed after approval"
+            )
+
+            stale = (
+                self._mark_stale(
+                    payload,
+                    reason,
+                )
+            )
+
+            raise ExecutionStaleError(
+                reason,
+                stale,
+            )
+
+        return (
+            definition,
+            snapshot,
+        )
+
+    def execute(
+        self,
+        run_id: str,
+        *,
+        confirm_execution: bool = False,
+    ) -> dict[str, Any]:
+        with self._lock:
+            payload = self._load(
+                run_id
+            )
+
+            if (
+                payload.get(
+                    "protocol"
+                )
+                != EXECUTION_PROTOCOL
+            ):
+                raise ExecutionStateError(
+                    "Only P0.6D.2B execution "
+                    "proposals may be executed"
+                )
+
+            if (
+                payload["status"]
+                != "APPROVED"
+            ):
+                raise ExecutionStateError(
+                    "Execution proposal must "
+                    "be APPROVED before execute"
+                )
+
+            if (
+                confirm_execution
+                is not True
+            ):
+                raise ValueError(
+                    "Execution requires literal "
+                    "confirm_execution=true"
+                )
+
+            (
+                definition,
+                before_snapshot,
+            ) = (
+                self._execution_stale_check(
+                    payload
+                )
+            )
+
+            workspace = (
+                self._workspaces.get(
+                    payload[
+                        "workspace_id"
+                    ]
+                )
+            )
+
+            if (
+                not workspace.get(
+                    "exists"
+                )
+                or workspace.get(
+                    "kind"
+                )
+                != "directory"
+            ):
+                stale = (
+                    self._mark_stale(
+                        payload,
+                        "Execution workspace "
+                        "is no longer an "
+                        "available directory",
+                    )
+                )
+
+                raise ExecutionStaleError(
+                    stale[
+                        "stale_reason"
+                    ],
+                    stale,
+                )
+
+            root = Path(
+                str(
+                    workspace[
+                        "path"
+                    ]
+                )
+            ).resolve()
+
+            if not root.is_dir():
+                stale = (
+                    self._mark_stale(
+                        payload,
+                        "Execution workspace "
+                        "directory is unavailable",
+                    )
+                )
+
+                raise ExecutionStaleError(
+                    stale[
+                        "stale_reason"
+                    ],
+                    stale,
+                )
+
+            started = _now()
+
+            payload[
+                "status"
+            ] = "EXECUTION_STARTED"
+
+            payload[
+                "execution_started_at"
+            ] = started
+
+            payload[
+                "execution_source"
+            ] = "user"
+
+            payload[
+                "execution_performed"
+            ] = True
+
+            payload[
+                "execution_attempts"
+            ] = (
+                int(
+                    payload.get(
+                        "execution_attempts"
+                    )
+                    or 0
+                )
+                + 1
+            )
+
+            payload[
+                "workspace_sha256_before_execution"
+            ] = (
+                before_snapshot[
+                    "workspace_sha256"
+                ]
+            )
+
+            payload["updated_at"] = (
+                started
+            )
+
+            payload[
+                "history"
+            ].append(
+                self._event(
+                    "EXECUTION_STARTED"
+                )
+            )
+
+            self._save(payload)
+
+            argv = list(
+                definition[
+                    "planned_argv"
+                ]
+            )
+
+            environment, runtime = (
+                self._execution_environment(
+                    payload["id"],
+                    argv[0],
+                )
+            )
+
+            payload[
+                "environment_policy"
+            ] = (
+                "minimal_no_user_secrets"
+            )
+
+            payload[
+                "runtime_path"
+            ] = str(runtime)
+
+            self._save(payload)
+
+            try:
+                result = (
+                    _run_bounded_process(
+                        argv=argv,
+                        cwd=root,
+                        env=environment,
+                        timeout_ms=int(
+                            definition[
+                                "timeout_ms"
+                            ]
+                        ),
+                    )
+                )
+
+            except Exception as exc:
+                finished = _now()
+
+                payload[
+                    "status"
+                ] = "EXECUTION_ERROR"
+
+                payload[
+                    "execution_finished_at"
+                ] = finished
+
+                payload[
+                    "execution_error"
+                ] = (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+
+                payload[
+                    "updated_at"
+                ] = finished
+
+                payload[
+                    "history"
+                ].append(
+                    self._event(
+                        "EXECUTION_ERROR",
+                        reason=(
+                            payload[
+                                "execution_error"
+                            ]
+                        ),
+                    )
+                )
+
+                self._save(payload)
+
+                return dict(payload)
+
+            payload.update(
+                {
+                    "exit_code": (
+                        result[
+                            "exit_code"
+                        ]
+                    ),
+                    "timed_out": (
+                        result[
+                            "timed_out"
+                        ]
+                    ),
+                    "process_group_terminated": (
+                        result[
+                            "process_group_terminated"
+                        ]
+                    ),
+                    "duration_ms": (
+                        result[
+                            "duration_ms"
+                        ]
+                    ),
+                    "stdout": (
+                        result[
+                            "stdout"
+                        ]
+                    ),
+                    "stderr": (
+                        result[
+                            "stderr"
+                        ]
+                    ),
+                    "stdout_sha256": (
+                        result[
+                            "stdout_sha256"
+                        ]
+                    ),
+                    "stderr_sha256": (
+                        result[
+                            "stderr_sha256"
+                        ]
+                    ),
+                    "stdout_bytes": (
+                        result[
+                            "stdout_bytes"
+                        ]
+                    ),
+                    "stderr_bytes": (
+                        result[
+                            "stderr_bytes"
+                        ]
+                    ),
+                    "stdout_truncated": (
+                        result[
+                            "stdout_truncated"
+                        ]
+                    ),
+                    "stderr_truncated": (
+                        result[
+                            "stderr_truncated"
+                        ]
+                    ),
+                    "stdout_reader_error": (
+                        result[
+                            "stdout_reader_error"
+                        ]
+                    ),
+                    "stderr_reader_error": (
+                        result[
+                            "stderr_reader_error"
+                        ]
+                    ),
+                }
+            )
+
+            post_snapshot_error = None
+            after_snapshot = None
+
+            try:
+                after_snapshot = (
+                    self._detector
+                    .snapshot(
+                        payload[
+                            "workspace_id"
+                        ]
+                    )
+                )
+
+            except Exception as exc:
+                post_snapshot_error = (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+
+            if (
+                after_snapshot
+                is not None
+            ):
+                payload[
+                    "workspace_sha256_after_execution"
+                ] = (
+                    after_snapshot[
+                        "workspace_sha256"
+                    ]
+                )
+
+                payload[
+                    "workspace_changed_during_execution"
+                ] = (
+                    after_snapshot[
+                        "workspace_sha256"
+                    ]
+                    != before_snapshot[
+                        "workspace_sha256"
+                    ]
+                )
+
+            else:
+                payload[
+                    "workspace_sha256_after_execution"
+                ] = None
+
+                payload[
+                    "workspace_changed_during_execution"
+                ] = True
+
+                payload[
+                    "post_snapshot_error"
+                ] = (
+                    post_snapshot_error
+                )
+
+            if result[
+                "timed_out"
+            ]:
+                final_status = (
+                    "TIMED_OUT"
+                )
+
+            elif (
+                result[
+                    "exit_code"
+                ]
+                == 0
+            ):
+                final_status = (
+                    "PASSED"
+                )
+
+            else:
+                final_status = (
+                    "FAILED"
+                )
+
+            finished = _now()
+
+            payload["status"] = (
+                final_status
+            )
+
+            payload[
+                "execution_finished_at"
+            ] = finished
+
+            payload["updated_at"] = (
+                finished
+            )
+
+            payload[
+                "history"
+            ].append(
+                self._event(
+                    final_status
                 )
             )
 

@@ -448,7 +448,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "terminal_execution": TERMINAL_MODE,
                     "terminal_shell": TERMINAL_SHELL,
                     "execution_protocol": EXECUTION_PROTOCOL,
-                    "project_execution": "proposal_approval_only",
+                    "project_execution": "approved_explicit_execute",
                     "conversation_storage": (
                         "local"
                     ),
@@ -514,7 +514,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "terminal_execution": TERMINAL_MODE,
                     "terminal_shell": TERMINAL_SHELL,
                     "execution_protocol": EXECUTION_PROTOCOL,
-                    "project_execution": "proposal_approval_only",
+                    "project_execution": "approved_explicit_execute",
                     "conversation_storage": (
                         "local"
                     ),
@@ -1112,6 +1112,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 and parts[2] in {
                     "approve",
                     "reject",
+                    "execute",
                 }
             ):
                 if not self._require_session():
@@ -1129,6 +1130,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             .executions
                             .approve(
                                 run_id
+                            )
+                        )
+
+                    elif action == "execute":
+                        proposal = (
+                            self.server
+                            .executions
+                            .execute(
+                                run_id,
+                                confirm_execution=(
+                                    payload.get(
+                                        "confirm_execution"
+                                    )
+                                    is True
+                                ),
                             )
                         )
 
@@ -1797,7 +1813,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6D.2A"
+        "MAESTRO LOCAL GATEWAY — P0.6D.2B"
     )
     print("=" * 72)
     print(
