@@ -21,6 +21,12 @@ from .changes import (
 from .config import GatewayConfig
 from .conversations import ConversationStore
 from .core import MaestroCoreBridge
+from .execution import (
+    EXECUTION_PROTOCOL,
+    ExecutionProposalStore,
+    ExecutionStaleError,
+    ExecutionStateError,
+)
 from .mission import GovernedDirectMissionRunner
 from .ollama import discover_ollama
 from .terminal import (
@@ -146,6 +152,11 @@ class GatewayHTTPServer(ThreadingHTTPServer):
 
         self.changes = ChangeProposalStore(
             user_root / "changes",
+            self.workspaces,
+        )
+
+        self.executions = ExecutionProposalStore(
+            user_root / "executions",
             self.workspaces,
         )
 
@@ -436,6 +447,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "terminal_protocol": TERMINAL_PROTOCOL,
                     "terminal_execution": TERMINAL_MODE,
                     "terminal_shell": TERMINAL_SHELL,
+                    "execution_protocol": EXECUTION_PROTOCOL,
+                    "project_execution": "proposal_approval_only",
                     "conversation_storage": (
                         "local"
                     ),
@@ -500,6 +513,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "terminal_protocol": TERMINAL_PROTOCOL,
                     "terminal_execution": TERMINAL_MODE,
                     "terminal_shell": TERMINAL_SHELL,
+                    "execution_protocol": EXECUTION_PROTOCOL,
+                    "project_execution": "proposal_approval_only",
                     "conversation_storage": (
                         "local"
                     ),
@@ -512,6 +527,112 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+
+        if path == "/execution-profiles":
+            if not self._require_session():
+                return
+
+            workspace_id = str(
+                query.get(
+                    "workspace_id",
+                    [""],
+                )[0]
+                or ""
+            ).strip()
+
+            if not workspace_id:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": "workspace_id_required",
+                    },
+                )
+                return
+
+            try:
+                payload = (
+                    self.server
+                    .executions
+                    .profiles(
+                        workspace_id
+                    )
+                )
+            except KeyError as exc:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "error": "workspace_not_found",
+                        "message": str(exc),
+                    },
+                )
+                return
+            except (
+                ValueError,
+                PermissionError,
+                FileNotFoundError,
+            ) as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": "execution_profile_detection_rejected",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            self._send_json(
+                HTTPStatus.OK,
+                payload,
+            )
+            return
+
+        if path == "/executions":
+            if not self._require_session():
+                return
+
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "protocol": EXECUTION_PROTOCOL,
+                    "executions": (
+                        self.server
+                        .executions
+                        .list()
+                    ),
+                },
+            )
+            return
+
+        if path.startswith("/executions/"):
+            if not self._require_session():
+                return
+
+            parts = path.strip("/").split("/")
+
+            if len(parts) == 2:
+                run_id = parts[1]
+
+                try:
+                    payload = (
+                        self.server
+                        .executions
+                        .get(run_id)
+                    )
+                except KeyError:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {
+                            "error": "execution_not_found",
+                            "run_id": run_id,
+                        },
+                    )
+                    return
+
+                self._send_json(
+                    HTTPStatus.OK,
+                    payload,
+                )
+                return
 
         if path == "/capabilities":
             if not self._require_session():
@@ -919,6 +1040,162 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+
+        if path == "/executions/propose":
+            if not self._require_session():
+                return
+
+            try:
+                payload = self._read_json()
+
+                proposal = (
+                    self.server
+                    .executions
+                    .propose(
+                        workspace_id=str(
+                            payload.get(
+                                "workspace_id"
+                            )
+                            or ""
+                        ),
+                        kind=str(
+                            payload.get(
+                                "kind"
+                            )
+                            or ""
+                        ),
+                        profile=str(
+                            payload.get(
+                                "profile"
+                            )
+                            or ""
+                        ),
+                    )
+                )
+
+            except KeyError as exc:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "error": "workspace_not_found",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            except (
+                ValueError,
+                PermissionError,
+                FileNotFoundError,
+            ) as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": "execution_proposal_rejected",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            self._send_json(
+                HTTPStatus.CREATED,
+                proposal,
+            )
+            return
+
+        if path.startswith("/executions/"):
+            parts = path.strip("/").split("/")
+
+            if (
+                len(parts) == 3
+                and parts[0] == "executions"
+                and parts[2] in {
+                    "approve",
+                    "reject",
+                }
+            ):
+                if not self._require_session():
+                    return
+
+                run_id = parts[1]
+                action = parts[2]
+
+                try:
+                    payload = self._read_json()
+
+                    if action == "approve":
+                        proposal = (
+                            self.server
+                            .executions
+                            .approve(
+                                run_id
+                            )
+                        )
+
+                    else:
+                        proposal = (
+                            self.server
+                            .executions
+                            .reject(
+                                run_id,
+                                reason=(
+                                    payload.get(
+                                        "reason"
+                                    )
+                                ),
+                            )
+                        )
+
+                except KeyError:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {
+                            "error": "execution_not_found",
+                            "run_id": run_id,
+                        },
+                    )
+                    return
+
+                except ExecutionStaleError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": "execution_proposal_stale",
+                            "message": str(exc),
+                            "proposal": exc.proposal,
+                        },
+                    )
+                    return
+
+                except ExecutionStateError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": "invalid_execution_state",
+                            "message": str(exc),
+                        },
+                    )
+                    return
+
+                except (
+                    ValueError,
+                    PermissionError,
+                    FileNotFoundError,
+                ) as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "execution_action_rejected",
+                            "message": str(exc),
+                        },
+                    )
+                    return
+
+                self._send_json(
+                    HTTPStatus.OK,
+                    proposal,
+                )
+                return
 
         if path == "/changes/propose":
             if not self._require_session():
@@ -1520,7 +1797,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6D.1"
+        "MAESTRO LOCAL GATEWAY — P0.6D.2A"
     )
     print("=" * 72)
     print(
