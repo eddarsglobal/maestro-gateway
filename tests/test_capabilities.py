@@ -68,14 +68,15 @@ class CapabilityRegistryTests(unittest.TestCase):
                 "user",
             )
 
-    def test_delete_remains_disabled(self):
+    def test_delete_is_governed(self):
         index = self.index(workspace_active=True)
 
         self.assertEqual(
             index["filesystem.delete"]["status"],
-            "not_available_p0_6c1",
+            "available_governed_requires_user_approval",
         )
 
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(
+            index["filesystem.delete"]["approval"],
+            "user",
+        )

@@ -424,9 +424,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "P0.6A"
                     ),
                     "change_protocol": (
-                        "P0.6C.1"
+                        "P0.6C.2"
                     ),
                     "workspace_write_execution": True,
+                    "workspace_delete_execution": True,
                     "conversation_storage": (
                         "local"
                     ),
@@ -484,9 +485,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "P0.6A"
                     ),
                     "change_protocol": (
-                        "P0.6C.1"
+                        "P0.6C.2"
                     ),
                     "workspace_write_execution": True,
+                    "workspace_delete_execution": True,
                     "conversation_storage": (
                         "local"
                     ),
@@ -956,7 +958,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         proposal = (
                             self.server
                             .changes
-                            .approve(change_id)
+                            .approve(
+                                change_id,
+                                confirm_delete=(
+                                    payload.get("confirm_delete") is True
+                                ),
+                            )
                         )
                     elif action == "reject":
                         proposal = (
@@ -1477,7 +1484,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6C.1"
+        "MAESTRO LOCAL GATEWAY — P0.6C.2"
     )
     print("=" * 72)
     print(
@@ -1488,7 +1495,7 @@ def main() -> int:
         f"Runtime : {config.runtime_dir}"
     )
     print(
-        "Workspace: governed read + governed writes + relocation"
+        "Workspace: governed writes + relocation + recoverable delete"
     )
     print(
         "Quality : anti-echo + recoverable tool guard enabled"
@@ -1497,10 +1504,10 @@ def main() -> int:
         "Picker  : macOS native file/folder chooser"
     )
     print(
-        "Changes : write/edit/patch + governed rename/move"
+        "Changes : write/edit/patch + rename/move + recoverable delete"
     )
     print(
-        "Mutate  : APPROVE != APPLY; NO-OVERWRITE relocation ENABLED"
+        "Mutate  : APPROVE != APPLY; RECOVERABLE DELETE ENABLED"
     )
     print("=" * 72)
 

@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import re
+import stat
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -16,10 +17,19 @@ from .workspace import WorkspaceRegistry
 
 
 MAX_CHANGE_BYTES = 1_048_576
+MAX_DELETE_BYTES = 64 * 1024 * 1024
 MAX_DIFF_CHARS = 120_000
 _CHANGE_ID = re.compile(r"^CHG-[A-F0-9]{12}$")
-_ALLOWED_OPERATIONS = {"write", "edit", "patch", "rename", "move"}
+_ALLOWED_OPERATIONS = {
+    "write",
+    "edit",
+    "patch",
+    "rename",
+    "move",
+    "delete",
+}
 _RELOCATION_OPERATIONS = {"rename", "move"}
+_DELETE_OPERATION = "delete"
 
 
 class ProposalConflictError(RuntimeError):
@@ -159,7 +169,7 @@ def _write_transaction_temp(
 class ChangeProposalStore:
     """Local proposal ledger for governed filesystem changes.
 
-    P0.6B.3 supports governed atomic apply after explicit approval. Proposal creation and approval remain write-free; only apply() may mutate the authorized workspace.
+    P0.6C.2 supports governed write, relocation, and recoverable file deletion after explicit approval. Proposal creation and approval remain workspace-mutation-free; only apply() may mutate the authorized workspace.
     """
 
     def __init__(
@@ -169,6 +179,18 @@ class ChangeProposalStore:
     ) -> None:
         self.root = Path(root).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
+
+        self.recovery_root = self.root / "_recovery"
+        self.recovery_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        try:
+            os.chmod(self.recovery_root, 0o700)
+        except OSError:
+            pass
+
         self.workspaces = workspaces
         self._lock = threading.RLock()
 
@@ -219,6 +241,7 @@ class ChangeProposalStore:
         result = dict(payload)
         result.pop("proposed_content", None)
         result.pop("before_content", None)
+        result.pop("recovery_stage_path", None)
         return result
 
     @staticmethod
@@ -303,6 +326,686 @@ class ChangeProposalStore:
             raise ValueError("Binary files are not writable in P0.6B.3")
 
         return True, _sha256(raw)
+
+    def _recovery_path(
+        self,
+        change_id: str,
+    ) -> Path:
+        return (
+            self.recovery_root
+            / f"{self._validate_id(change_id)}.recovery"
+        )
+
+    def _delete_snapshot(
+        self,
+        *,
+        workspace_id: str,
+        relative: str,
+    ) -> dict[str, Any]:
+        target_info = self.workspaces.resolve_change_target(
+            workspace_id,
+            relative,
+        )
+
+        target = Path(
+            str(target_info["absolute_path"])
+        )
+
+        if target.is_symlink():
+            raise PermissionError(
+                "Symlink delete targets are not allowed"
+            )
+
+        if not target.exists():
+            return {
+                "target_info": target_info,
+                "target": target,
+                "state": {
+                    "exists": False,
+                    "sha256": None,
+                    "size": 0,
+                    "inode": None,
+                    "device": None,
+                    "mode": None,
+                },
+            }
+
+        info = os.lstat(target)
+
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(
+                "P0.6C.2 delete supports regular files only"
+            )
+
+        if info.st_size > MAX_DELETE_BYTES:
+            raise ValueError(
+                "Delete target exceeds "
+                f"{MAX_DELETE_BYTES} byte recovery limit"
+            )
+
+        return {
+            "target_info": target_info,
+            "target": target,
+            "state": {
+                "exists": True,
+                "sha256": _sha256_file(target),
+                "size": info.st_size,
+                "inode": info.st_ino,
+                "device": info.st_dev,
+                "mode": stat.S_IMODE(info.st_mode),
+            },
+        }
+
+    def _raise_delete_stale(
+        self,
+        payload: dict[str, Any],
+        reason: str,
+    ) -> None:
+        now = _utc_now()
+
+        payload["status"] = "STALE"
+        payload["updated_at"] = now
+        payload["stale_reason"] = reason
+
+        payload.setdefault("history", []).append(
+            self._event(
+                "STALE",
+                reason=reason,
+            )
+        )
+
+        self._save(payload)
+
+        raise ProposalConflictError(
+            reason,
+            self._public(payload),
+        )
+
+    def _assert_delete_fresh(
+        self,
+        payload: dict[str, Any],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        snapshot = self._delete_snapshot(
+            workspace_id=str(payload["workspace_id"]),
+            relative=str(payload["path"]),
+        )
+
+        state = snapshot["state"]
+
+        expected = {
+            "exists": True,
+            "sha256": payload.get("before_sha256"),
+            "size": payload.get("before_size"),
+            "inode": payload.get("before_inode"),
+            "device": payload.get("before_device"),
+            "mode": payload.get("before_mode"),
+        }
+
+        if any(
+            state.get(key) != value
+            for key, value in expected.items()
+        ):
+            self._raise_delete_stale(
+                payload,
+                (
+                    "Delete target changed "
+                    f"before {phase}"
+                ),
+            )
+
+        return snapshot
+
+    def _propose_delete(
+        self,
+        *,
+        workspace_id: str,
+        relative: str,
+    ) -> dict[str, Any]:
+        snapshot = self._delete_snapshot(
+            workspace_id=workspace_id,
+            relative=relative,
+        )
+
+        target_info = snapshot["target_info"]
+        state = snapshot["state"]
+
+        if not state["exists"]:
+            raise FileNotFoundError(
+                "Delete requires an existing file"
+            )
+
+        display_path = str(target_info["path"])
+
+        diff = (
+            f"--- {display_path}\n"
+            "+++ /dev/null\n"
+            "@@ MAESTRO DELETE @@\n"
+            f"-{display_path}\n"
+        )
+
+        now = _utc_now()
+        change_id = _change_id()
+
+        payload: dict[str, Any] = {
+            "id": change_id,
+            "protocol": "P0.6C.2",
+            "workspace_id": workspace_id,
+            "workspace_label": (
+                target_info["workspace_label"]
+            ),
+            "operation": "delete",
+            "effect": "delete",
+            "path": display_path,
+            "before_exists": True,
+            "before_sha256": state["sha256"],
+            "after_sha256": None,
+            "before_size": state["size"],
+            "after_size": 0,
+            "before_inode": state["inode"],
+            "before_device": state["device"],
+            "before_mode": state["mode"],
+            "risk_level": "high",
+            "delete_confirmation_required": True,
+            "recovery_required": True,
+            "recovery_available": False,
+            "diff": diff,
+            "diff_truncated": False,
+            "status": "AWAITING_APPROVAL",
+            "approval_required": True,
+            "workspace_write_performed": False,
+            "created_at": now,
+            "updated_at": now,
+            "history": [
+                self._event("PROPOSED")
+            ],
+        }
+
+        with self._lock:
+            self._save(payload)
+
+        return self._public(payload)
+
+    def _write_delete_stage(
+        self,
+        source: Path,
+        stage: Path,
+        expected_sha256: str,
+    ) -> None:
+        if stage.exists():
+            if (
+                not stage.is_file()
+                or _sha256_file(stage)
+                != expected_sha256
+            ):
+                raise OSError(
+                    "Recovery stage collision or integrity failure"
+                )
+
+            return
+
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{stage.name}.",
+            suffix=".tmp",
+            dir=str(self.recovery_root),
+        )
+
+        temp_path = Path(temp_name)
+        fd_open = True
+
+        try:
+            os.fchmod(fd, 0o600)
+
+            with os.fdopen(fd, "wb") as destination:
+                fd_open = False
+
+                with source.open("rb") as source_handle:
+                    while True:
+                        chunk = source_handle.read(
+                            1024 * 1024
+                        )
+
+                        if not chunk:
+                            break
+
+                        destination.write(chunk)
+
+                destination.flush()
+                os.fsync(destination.fileno())
+
+            if _sha256_file(temp_path) != expected_sha256:
+                raise OSError(
+                    "Recovery staging SHA-256 mismatch"
+                )
+
+            try:
+                os.link(
+                    temp_path,
+                    stage,
+                )
+            except FileExistsError:
+                if (
+                    not stage.is_file()
+                    or _sha256_file(stage)
+                    != expected_sha256
+                ):
+                    raise OSError(
+                        "Recovery stage appeared with "
+                        "unexpected content"
+                    )
+
+            try:
+                os.chmod(stage, 0o600)
+            except OSError:
+                pass
+
+            _fsync_directory(self.recovery_root)
+
+        finally:
+            if fd_open:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _verify_delete_applied(
+        self,
+        target: Path,
+        stage: Path,
+        expected_sha256: str,
+    ) -> str:
+        if target.exists() or target.is_symlink():
+            raise OSError(
+                "Deleted target still exists"
+            )
+
+        if not stage.exists() or not stage.is_file():
+            raise OSError(
+                "Recovery stage is missing"
+            )
+
+        recovery_sha256 = _sha256_file(stage)
+
+        if recovery_sha256 != expected_sha256:
+            raise OSError(
+                "Recovery stage SHA-256 verification failed"
+            )
+
+        return recovery_sha256
+
+    def _restore_delete_from_stage(
+        self,
+        target: Path,
+        stage: Path,
+        expected_sha256: str,
+        mode: int,
+    ) -> None:
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(
+                "Rollback refused: original path is occupied"
+            )
+
+        if (
+            not stage.exists()
+            or not stage.is_file()
+            or _sha256_file(stage)
+            != expected_sha256
+        ):
+            raise OSError(
+                "Rollback recovery stage is invalid"
+            )
+
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.maestro-restore-",
+            suffix=".tmp",
+            dir=str(target.parent),
+        )
+
+        temp_path = Path(temp_name)
+        fd_open = True
+
+        try:
+            os.fchmod(fd, mode)
+
+            with os.fdopen(fd, "wb") as destination:
+                fd_open = False
+
+                with stage.open("rb") as source:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+
+                        if not chunk:
+                            break
+
+                        destination.write(chunk)
+
+                destination.flush()
+                os.fsync(destination.fileno())
+
+            if _sha256_file(temp_path) != expected_sha256:
+                raise OSError(
+                    "Rollback temporary SHA mismatch"
+                )
+
+            # Hard-link publication is NO-OVERWRITE.
+            os.link(
+                temp_path,
+                target,
+            )
+
+            _fsync_directory(target.parent)
+
+        finally:
+            if fd_open:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if (
+            not target.exists()
+            or not target.is_file()
+            or _sha256_file(target)
+            != expected_sha256
+        ):
+            raise OSError(
+                "Delete rollback verification failed"
+            )
+
+    def _commit_delete_recovery(
+        self,
+        payload: dict[str, Any],
+        *,
+        expected_sha256: str,
+        recovered_action: str,
+    ) -> dict[str, Any]:
+        now = _utc_now()
+
+        payload["status"] = "APPLIED"
+        payload["applied_at"] = now
+        payload["updated_at"] = now
+        payload["workspace_write_performed"] = True
+        payload["workspace_state_restored"] = False
+        payload["apply_protocol"] = "P0.6C.2"
+        payload["deleted_path"] = payload["path"]
+        payload["deleted_sha256"] = expected_sha256
+        payload["applied_sha256"] = expected_sha256
+        payload["recovery_available"] = True
+        payload["recovery_sha256"] = expected_sha256
+        payload["recovered_after_restart"] = True
+
+        payload.setdefault("history", []).append(
+            self._event(recovered_action)
+        )
+
+        self._save(payload)
+        return self._public(payload)
+
+    def _apply_delete(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        history = payload.setdefault(
+            "history",
+            [],
+        )
+
+        expected_sha256 = str(
+            payload.get("before_sha256") or ""
+        )
+
+        if not expected_sha256:
+            raise ProposalApplyError(
+                "Delete proposal has no source SHA-256",
+                self._public(payload),
+            )
+
+        stage = self._recovery_path(
+            str(payload["id"])
+        )
+
+        snapshot = self._delete_snapshot(
+            workspace_id=str(payload["workspace_id"]),
+            relative=str(payload["path"]),
+        )
+
+        target = snapshot["target"]
+        state = snapshot["state"]
+
+        had_apply_start = any(
+            isinstance(row, dict)
+            and row.get("action") == "APPLY_STARTED"
+            for row in history
+        )
+
+        # Crash completion:
+        # target gone + valid private recovery => deletion happened.
+        if had_apply_start and not state["exists"]:
+            if (
+                stage.exists()
+                and stage.is_file()
+                and _sha256_file(stage)
+                == expected_sha256
+            ):
+                return self._commit_delete_recovery(
+                    payload,
+                    expected_sha256=expected_sha256,
+                    recovered_action="APPLIED_RECOVERED",
+                )
+
+            now = _utc_now()
+            reason = (
+                "Delete recovery failed: target is absent "
+                "and no valid recovery stage exists"
+            )
+
+            payload["status"] = "ROLLBACK_FAILED"
+            payload["updated_at"] = now
+            payload["apply_error"] = reason
+            payload["workspace_write_performed"] = True
+            payload["workspace_state_restored"] = False
+
+            history.append(
+                self._event(
+                    "ROLLBACK_FAILED",
+                    reason=reason,
+                )
+            )
+
+            self._save(payload)
+
+            raise ProposalApplyError(
+                reason,
+                self._public(payload),
+            )
+
+        snapshot = self._assert_delete_fresh(
+            payload,
+            phase="apply",
+        )
+
+        target = snapshot["target"]
+
+        now = _utc_now()
+
+        payload["apply_started_at"] = (
+            payload.get("apply_started_at") or now
+        )
+        payload["updated_at"] = now
+        payload["apply_protocol"] = "P0.6C.2"
+        payload["apply_attempts"] = (
+            int(payload.get("apply_attempts") or 0)
+            + 1
+        )
+
+        if not had_apply_start:
+            history.append(
+                self._event("APPLY_STARTED")
+            )
+        else:
+            history.append(
+                self._event("APPLY_RESUMED")
+            )
+
+        self._save(payload)
+
+        workspace_mutated = False
+
+        try:
+            # Stage first. The workspace file still exists here.
+            self._write_delete_stage(
+                target,
+                stage,
+                expected_sha256,
+            )
+
+            payload["recovery_available"] = True
+            payload["recovery_sha256"] = expected_sha256
+            payload["recovery_size"] = payload[
+                "before_size"
+            ]
+            payload["recovery_staged_at"] = _utc_now()
+            payload["updated_at"] = _utc_now()
+
+            history.append(
+                self._event("RECOVERY_STAGED")
+            )
+
+            self._save(payload)
+
+            # Final source fingerprint check immediately
+            # before the destructive filesystem operation.
+            snapshot = self._assert_delete_fresh(
+                payload,
+                phase="delete execution",
+            )
+
+            target = snapshot["target"]
+
+            os.unlink(target)
+            workspace_mutated = True
+
+            _fsync_directory(target.parent)
+
+            recovery_sha256 = (
+                self._verify_delete_applied(
+                    target,
+                    stage,
+                    expected_sha256,
+                )
+            )
+
+        except ProposalConflictError:
+            raise
+
+        except Exception as exc:
+            rollback_ok = False
+            rollback_error: str | None = None
+
+            if workspace_mutated:
+                try:
+                    self._restore_delete_from_stage(
+                        target,
+                        stage,
+                        expected_sha256,
+                        int(
+                            payload.get("before_mode")
+                            or 0o600
+                        ),
+                    )
+
+                    rollback_ok = True
+
+                except Exception as rollback_exc:
+                    rollback_error = (
+                        f"{type(rollback_exc).__name__}: "
+                        f"{rollback_exc}"
+                    )
+            else:
+                rollback_ok = True
+
+            now = _utc_now()
+
+            if workspace_mutated:
+                status = (
+                    "ROLLED_BACK"
+                    if rollback_ok
+                    else "ROLLBACK_FAILED"
+                )
+            else:
+                status = "APPLY_FAILED"
+
+            reason = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            payload["status"] = status
+            payload["updated_at"] = now
+            payload["apply_error"] = reason
+            payload["workspace_write_performed"] = (
+                workspace_mutated
+            )
+            payload["workspace_state_restored"] = (
+                rollback_ok
+            )
+
+            if rollback_error:
+                payload["rollback_error"] = (
+                    rollback_error
+                )
+
+            history.append(
+                self._event(
+                    status,
+                    reason=reason,
+                )
+            )
+
+            self._save(payload)
+
+            raise ProposalApplyError(
+                (
+                    "Delete failed; workspace was restored"
+                    if rollback_ok
+                    else
+                    "Delete failed and rollback "
+                    "could not be verified"
+                ),
+                self._public(payload),
+            ) from exc
+
+        now = _utc_now()
+
+        payload["status"] = "APPLIED"
+        payload["applied_at"] = now
+        payload["updated_at"] = now
+        payload["workspace_write_performed"] = True
+        payload["workspace_state_restored"] = False
+        payload["deleted_path"] = payload["path"]
+        payload["deleted_sha256"] = expected_sha256
+        payload["applied_sha256"] = expected_sha256
+        payload["recovery_available"] = True
+        payload["recovery_sha256"] = recovery_sha256
+        payload["recovered_after_restart"] = False
+
+        history.append(
+            self._event("APPLIED")
+        )
+
+        self._save(payload)
+
+        return self._public(payload)
 
     def _relocation_snapshot(
         self,
@@ -530,7 +1233,7 @@ class ChangeProposalStore:
 
         if op not in _ALLOWED_OPERATIONS:
             raise ValueError(
-                "operation must be one of: write, edit, patch, rename, move"
+                "operation must be one of: write, edit, patch, rename, move, delete"
             )
 
         rel = str(relative or "").strip()
@@ -543,6 +1246,12 @@ class ChangeProposalStore:
                 source_relative=rel,
                 destination_relative=str(destination or ""),
                 operation=op,
+            )
+
+        if op == _DELETE_OPERATION:
+            return self._propose_delete(
+                workspace_id=workspace_id,
+                relative=rel,
             )
 
         proposed_text, proposed_raw = _normalize_content(content)
@@ -632,7 +1341,12 @@ class ChangeProposalStore:
 
         return self._public(payload)
 
-    def approve(self, change_id: str) -> dict[str, Any]:
+    def approve(
+        self,
+        change_id: str,
+        *,
+        confirm_delete: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             payload = self._load(change_id)
 
@@ -641,7 +1355,19 @@ class ChangeProposalStore:
                     "Only AWAITING_APPROVAL proposals can be approved"
                 )
 
-            if (
+            if payload.get("operation") == _DELETE_OPERATION:
+                if not confirm_delete:
+                    raise ProposalStateError(
+                        "Delete approval requires "
+                        "confirm_delete=true"
+                    )
+
+                self._assert_delete_fresh(
+                    payload,
+                    phase="approval",
+                )
+
+            elif (
                 payload.get("operation")
                 in _RELOCATION_OPERATIONS
             ):
@@ -1129,6 +1855,9 @@ class ChangeProposalStore:
                 raise ProposalStateError(
                     "Only APPROVED proposals can be applied"
                 )
+
+            if payload.get("operation") == _DELETE_OPERATION:
+                return self._apply_delete(payload)
 
             if (
                 payload.get("operation")

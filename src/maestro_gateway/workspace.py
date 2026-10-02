@@ -353,7 +353,7 @@ class WorkspaceRegistry:
             cursor = selected
             for part in rel_path.parts:
                 cursor = cursor / part
-                if cursor.exists() and cursor.is_symlink():
+                if cursor.is_symlink():
                     raise PermissionError(
                         "Symlink mutation targets are not allowed"
                     )
@@ -378,7 +378,7 @@ class WorkspaceRegistry:
         parent = target.parent
         if not parent.exists() or not parent.is_dir():
             raise ValueError(
-                "Parent directory must already exist in P0.6C.1"
+                "Parent directory must already exist in P0.6C.2"
             )
 
         if target.exists() and target.is_dir():
