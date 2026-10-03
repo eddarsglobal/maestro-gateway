@@ -5,8 +5,10 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from maestro_gateway.git_staging import (
+    GitStageApplyError,
     GitStageConflictError,
     GitStageProposalStore,
     GitStageStateError,
@@ -785,32 +787,747 @@ class GitStageProposalTests(
                 ),
             )
 
-    def test_apply_is_unavailable_in_2a(
+    def test_apply_requires_approval(
         self,
     ):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
+            root = self.make_repo(
+                base
+            )
 
-            registry = (
-                WorkspaceRegistry(
-                    base
-                    / "registry.json"
+            (
+                root / "tracked.txt"
+            ).write_text(
+                "two\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
                 )
             )
 
-            store = (
-                GitStageProposalStore(
-                    base / "stage",
-                    registry,
-                )
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            before = self.index_sha(
+                root
             )
 
             with self.assertRaises(
                 GitStageStateError
             ):
                 store.apply(
-                    "GST-000000000000"
+                    proposal["id"],
+                    confirm_stage=True,
                 )
+
+            self.assertEqual(
+                self.index_sha(root),
+                before,
+            )
+
+    def test_apply_requires_literal_confirmation(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            (
+                root / "tracked.txt"
+            ).write_text(
+                "two\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            before = self.index_sha(
+                root
+            )
+
+            with self.assertRaises(
+                GitStageStateError
+            ):
+                store.apply(
+                    proposal["id"]
+                )
+
+            self.assertEqual(
+                self.index_sha(root),
+                before,
+            )
+
+    def test_approved_apply_stages_modified_file(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            (
+                root / "tracked.txt"
+            ).write_text(
+                "two\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            before = self.index_sha(
+                root
+            )
+
+            applied = store.apply(
+                proposal["id"],
+                confirm_stage=True,
+            )
+
+            self.assertEqual(
+                applied["status"],
+                "APPLIED",
+            )
+
+            self.assertTrue(
+                applied[
+                    "stage_performed"
+                ]
+            )
+
+            self.assertNotEqual(
+                self.index_sha(root),
+                before,
+            )
+
+            self.assertEqual(
+                self.staged_names(root),
+                "tracked.txt\n",
+            )
+
+            self.assertEqual(
+                applied[
+                    "apply_changed_paths"
+                ],
+                ["tracked.txt"],
+            )
+
+    def test_apply_stages_untracked_file(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            (
+                root / "new.txt"
+            ).write_text(
+                "new\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=["new.txt"],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            store.apply(
+                proposal["id"],
+                confirm_stage=True,
+            )
+
+            self.assertEqual(
+                self.staged_names(root),
+                "new.txt\n",
+            )
+
+    def test_apply_stages_deleted_file(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            (
+                root / "tracked.txt"
+            ).unlink()
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            store.apply(
+                proposal["id"],
+                confirm_stage=True,
+            )
+
+            result = self.git(
+                root,
+                "diff",
+                "--cached",
+                "--name-status",
+            )
+
+            self.assertEqual(
+                result.stdout.decode(
+                    "utf-8"
+                ),
+                "D\ttracked.txt\n",
+            )
+
+    def test_apply_is_anti_replay(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            (
+                root / "tracked.txt"
+            ).write_text(
+                "two\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            store.apply(
+                proposal["id"],
+                confirm_stage=True,
+            )
+
+            after = self.index_sha(
+                root
+            )
+
+            with self.assertRaises(
+                GitStageStateError
+            ):
+                store.apply(
+                    proposal["id"],
+                    confirm_stage=True,
+                )
+
+            self.assertEqual(
+                self.index_sha(root),
+                after,
+            )
+
+    def test_change_after_approval_blocks_apply(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            path = (
+                root / "tracked.txt"
+            )
+
+            path.write_text(
+                "two\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            before = self.index_sha(
+                root
+            )
+
+            path.write_text(
+                "three\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(
+                GitStageConflictError
+            ):
+                store.apply(
+                    proposal["id"],
+                    confirm_stage=True,
+                )
+
+            self.assertEqual(
+                self.index_sha(root),
+                before,
+            )
+
+            self.assertEqual(
+                store.get(
+                    proposal["id"]
+                )["status"],
+                "STALE",
+            )
+
+    def test_change_during_candidate_preparation_blocks_apply(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            path = (
+                root / "tracked.txt"
+            )
+
+            path.write_text(
+                "two\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            before = self.index_sha(
+                root
+            )
+
+            original_changed = (
+                store._changed_index_paths
+            )
+
+            def mutate_after_candidate(
+                before_inventory,
+                after_inventory,
+            ):
+                # Candidate already represents
+                # "two". Change the worktree
+                # before the final governed
+                # snapshot.
+                path.write_text(
+                    "three\n",
+                    encoding="utf-8",
+                )
+
+                return original_changed(
+                    before_inventory,
+                    after_inventory,
+                )
+
+            with mock.patch.object(
+                store,
+                "_changed_index_paths",
+                side_effect=(
+                    mutate_after_candidate
+                ),
+            ):
+                with self.assertRaises(
+                    GitStageConflictError
+                ):
+                    store.apply(
+                        proposal["id"],
+                        confirm_stage=True,
+                    )
+
+            self.assertEqual(
+                self.index_sha(root),
+                before,
+            )
+
+            self.assertEqual(
+                self.staged_names(root),
+                "",
+            )
+
+            row = store.get(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                row["status"],
+                "STALE",
+            )
+
+            self.assertFalse(
+                row["stage_performed"]
+            )
+
+    def test_apply_preserves_unrelated_staged_entry(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            (
+                root / "other.txt"
+            ).write_text(
+                "other\n",
+                encoding="utf-8",
+            )
+
+            self.git(
+                root,
+                "add",
+                "--",
+                "other.txt",
+            )
+
+            (
+                root / "tracked.txt"
+            ).write_text(
+                "two\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            store.apply(
+                proposal["id"],
+                confirm_stage=True,
+            )
+
+            names = set(
+                self.staged_names(
+                    root
+                ).splitlines()
+            )
+
+            self.assertEqual(
+                names,
+                {
+                    "other.txt",
+                    "tracked.txt",
+                },
+            )
+
+    def test_verification_failure_rolls_back_exact_index(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            (
+                root / "tracked.txt"
+            ).write_text(
+                "two\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            before = self.index_sha(
+                root
+            )
+
+            with mock.patch.object(
+                store,
+                "_verify_committed_index",
+                side_effect=RuntimeError(
+                    "forced verification failure"
+                ),
+            ):
+                with self.assertRaises(
+                    GitStageApplyError
+                ):
+                    store.apply(
+                        proposal["id"],
+                        confirm_stage=True,
+                    )
+
+            self.assertEqual(
+                self.index_sha(root),
+                before,
+            )
+
+            row = store.get(
+                proposal["id"]
+            )
+
+            self.assertEqual(
+                row["status"],
+                "APPLY_FAILED_ROLLED_BACK",
+            )
+
+            self.assertFalse(
+                row[
+                    "stage_performed"
+                ]
+            )
+
+    def test_recovery_finalizes_committed_apply(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = self.make_repo(
+                base
+            )
+
+            (
+                root / "tracked.txt"
+            ).write_text(
+                "two\n",
+                encoding="utf-8",
+            )
+
+            store, workspace = (
+                self.store_for(
+                    base,
+                    root,
+                )
+            )
+
+            proposal = store.propose(
+                workspace_id=(
+                    workspace["id"]
+                ),
+                paths=[
+                    "tracked.txt"
+                ],
+            )
+
+            store.approve(
+                proposal["id"]
+            )
+
+            applied = store.apply(
+                proposal["id"],
+                confirm_stage=True,
+            )
+
+            payload = store._load(
+                proposal["id"]
+            )
+
+            payload[
+                "status"
+            ] = "APPLYING"
+
+            payload[
+                "stage_performed"
+            ] = False
+
+            payload.pop(
+                "applied_at",
+                None,
+            )
+
+            store._save(
+                payload
+            )
+
+            recovered_store = (
+                GitStageProposalStore(
+                    store.root,
+                    store.workspaces,
+                )
+            )
+
+            recovered = (
+                recovered_store.get(
+                    proposal["id"]
+                )
+            )
+
+            self.assertEqual(
+                recovered["status"],
+                "APPLIED",
+            )
+
+            self.assertTrue(
+                recovered[
+                    "stage_performed"
+                ]
+            )
+
+            self.assertTrue(
+                recovered[
+                    "recovered_after_restart"
+                ]
+            )
+
+            self.assertEqual(
+                recovered[
+                    "apply_after_index_sha256"
+                ],
+                applied[
+                    "apply_after_index_sha256"
+                ],
+            )
 
 
 if __name__ == "__main__":

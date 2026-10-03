@@ -223,7 +223,7 @@ class GitInspectionCapabilityTests(
 
         self.assertEqual(
             index["git.execute"]["status"],
-            "not_available_general_git_mutation_p0_6e2a",
+            "not_available_general_git_mutation_p0_6e2b",
         )
 
 
@@ -269,7 +269,7 @@ class GitStageCapabilityTests(
             index["git.stage"]["status"],
             (
                 "available_governed_"
-                "proposal_approval_only"
+                "approved_explicit_apply"
             ),
         )
 

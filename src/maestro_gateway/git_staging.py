@@ -21,8 +21,8 @@ from .git_inspection import (
 from .workspace import WorkspaceRegistry
 
 
-GIT_STAGE_PROTOCOL = "P0.6E.2A"
-GIT_STAGE_MODE = "proposal_approval_only"
+GIT_STAGE_PROTOCOL = "P0.6E.2B"
+GIT_STAGE_MODE = "approved_explicit_apply"
 
 MAX_STAGE_PATHS = 32
 MAX_STAGE_PATH_CHARS = 512
@@ -54,6 +54,18 @@ class GitStageStateError(
     RuntimeError
 ):
     pass
+
+
+class GitStageApplyError(
+    RuntimeError
+):
+    def __init__(
+        self,
+        message: str,
+        proposal: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.proposal = proposal
 
 
 def _utc_now() -> str:
@@ -299,19 +311,19 @@ def _stage_kind(
     if first.startswith("! "):
         raise PermissionError(
             "Ignored files cannot be "
-            "staged in P0.6E.2A"
+            "staged in P0.6E.2B"
         )
 
     if first.startswith("u "):
         raise ValueError(
             "Unmerged/conflicted paths "
-            "cannot be staged in P0.6E.2A"
+            "cannot be staged in P0.6E.2B"
         )
 
     if first.startswith("2 "):
         raise ValueError(
             "Rename/copy staging is "
-            "not supported in P0.6E.2A"
+            "not supported in P0.6E.2B"
         )
 
     if first.startswith("1 "):
@@ -353,13 +365,13 @@ def _stage_kind(
 
 class GitStageProposalStore:
     """
-    P0.6E.2A governed Git staging ledger.
+    P0.6E.2B governed Git staging ledger.
 
     Proposal creation and approval are
     strictly index-mutation-free.
 
     There is intentionally no staging
-    apply implementation in P0.6E.2A.
+    apply implementation in P0.6E.2B.
     """
 
     def __init__(
@@ -386,6 +398,27 @@ class GitStageProposalStore:
 
         self.workspaces = workspaces
         self._lock = threading.RLock()
+
+        self.transaction_root = (
+            self.root
+            / "_transactions"
+        )
+
+        self.transaction_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        try:
+            os.chmod(
+                self.transaction_root,
+                0o700,
+            )
+        except OSError:
+            pass
+
+        with self._lock:
+            self._recover_incomplete()
 
     def _validate_id(
         self,
@@ -737,7 +770,7 @@ class GitStageProposalStore:
 
             if not index_path.exists():
                 raise ValueError(
-                    "P0.6E.2A requires "
+                    "P0.6E.2B requires "
                     "an existing Git index"
                 )
 
@@ -1155,6 +1188,9 @@ class GitStageProposalStore:
                 "repository_root": str(
                     repository_root
                 ),
+                "git_dir": str(
+                    git_dir
+                ),
                 "runner": {
                     "path": str(
                         git_path
@@ -1189,6 +1225,597 @@ class GitStageProposalStore:
                     )
                 ),
             }
+
+    def _transaction_paths(
+        self,
+        stage_id: str,
+    ) -> tuple[Path, Path]:
+        value = self._validate_id(
+            stage_id
+        )
+
+        return (
+            self.transaction_root
+            / f"{value}.before.index",
+            self.transaction_root
+            / f"{value}.candidate.index",
+        )
+
+    def _write_private_bytes(
+        self,
+        path: Path,
+        raw: bytes,
+        *,
+        mode: int = 0o600,
+    ) -> None:
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        tmp = path.with_name(
+            "."
+            + path.name
+            + "."
+            + uuid.uuid4().hex
+            + ".tmp"
+        )
+
+        try:
+            with tmp.open(
+                "xb"
+            ) as handle:
+                try:
+                    os.chmod(
+                        tmp,
+                        mode,
+                    )
+                except OSError:
+                    pass
+
+                handle.write(raw)
+                handle.flush()
+                os.fsync(
+                    handle.fileno()
+                )
+
+            os.replace(
+                tmp,
+                path,
+            )
+
+            try:
+                os.chmod(
+                    path,
+                    mode,
+                )
+            except OSError:
+                pass
+
+            _fsync_directory(
+                path.parent
+            )
+
+        finally:
+            try:
+                tmp.unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
+
+    def _cleanup_transaction(
+        self,
+        stage_id: str,
+    ) -> None:
+        before, candidate = (
+            self._transaction_paths(
+                stage_id
+            )
+        )
+
+        for path in (
+            before,
+            candidate,
+            candidate.with_name(
+                candidate.name
+                + ".lock"
+            ),
+        ):
+            try:
+                path.unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
+
+    def _index_inventory(
+        self,
+        *,
+        repository_root: Path,
+        git_path: Path,
+        env: dict[str, str],
+    ) -> tuple[
+        dict[str, tuple[str, ...]],
+        dict[str, Any],
+    ]:
+        result = _call(
+            git_path=git_path,
+            cwd=repository_root,
+            env=env,
+            args=[
+                "ls-files",
+                "--stage",
+                "-z",
+            ],
+            timeout_ms=8_000,
+        )
+
+        _require_success(
+            result,
+            operation=(
+                "Git index inventory"
+            ),
+        )
+
+        if result.get(
+            "stdout_truncated"
+        ):
+            raise ValueError(
+                "Git index inventory exceeds "
+                "the bounded verification "
+                "limit"
+            )
+
+        inventory: dict[
+            str,
+            list[str],
+        ] = {}
+
+        for record in str(
+            result.get("stdout")
+            or ""
+        ).split("\x00"):
+            if not record:
+                continue
+
+            if "\t" not in record:
+                raise ValueError(
+                    "Unexpected Git index "
+                    "inventory record"
+                )
+
+            metadata, path = (
+                record.split(
+                    "\t",
+                    1,
+                )
+            )
+
+            inventory.setdefault(
+                path,
+                [],
+            ).append(
+                metadata
+            )
+
+        normalized = {
+            path: tuple(rows)
+            for path, rows
+            in inventory.items()
+        }
+
+        return (
+            normalized,
+            result,
+        )
+
+    @staticmethod
+    def _changed_index_paths(
+        before: dict[
+            str,
+            tuple[str, ...],
+        ],
+        after: dict[
+            str,
+            tuple[str, ...],
+        ],
+    ) -> list[str]:
+        keys = (
+            set(before)
+            | set(after)
+        )
+
+        return sorted(
+            path
+            for path in keys
+            if before.get(path)
+            != after.get(path)
+        )
+
+    def _write_index_lock(
+        self,
+        lock_path: Path,
+        raw: bytes,
+        *,
+        mode: int,
+    ) -> None:
+        fd = os.open(
+            str(lock_path),
+            (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+            ),
+            mode,
+        )
+
+        try:
+            try:
+                os.fchmod(
+                    fd,
+                    mode,
+                )
+            except OSError:
+                pass
+
+            with os.fdopen(
+                fd,
+                "wb",
+                closefd=False,
+            ) as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(
+                    handle.fileno()
+                )
+
+        finally:
+            os.close(fd)
+
+    def _rollback_index(
+        self,
+        *,
+        index_path: Path,
+        before_raw: bytes,
+        before_sha256: str,
+        candidate_sha256: str,
+        mode: int,
+    ) -> bool:
+        lock_path = (
+            index_path.parent
+            / (
+                index_path.name
+                + ".lock"
+            )
+        )
+
+        try:
+            self._write_index_lock(
+                lock_path,
+                before_raw,
+                mode=mode,
+            )
+
+        except FileExistsError:
+            return False
+
+        try:
+            if (
+                not index_path.exists()
+                or _sha256_file(
+                    index_path
+                )
+                != candidate_sha256
+            ):
+                return False
+
+            os.replace(
+                lock_path,
+                index_path,
+            )
+
+            _fsync_directory(
+                index_path.parent
+            )
+
+            return (
+                index_path.exists()
+                and _sha256_file(
+                    index_path
+                )
+                == before_sha256
+            )
+
+        finally:
+            try:
+                lock_path.unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
+
+    def _verify_committed_index(
+        self,
+        *,
+        index_path: Path,
+        expected_sha256: str,
+    ) -> None:
+        if (
+            not index_path.exists()
+            or _sha256_file(
+                index_path
+            )
+            != expected_sha256
+        ):
+            raise RuntimeError(
+                "Committed Git index "
+                "verification failed"
+            )
+
+    def _mark_apply_failure(
+        self,
+        payload: dict[str, Any],
+        *,
+        status: str,
+        reason: str,
+        stage_performed: bool,
+    ) -> dict[str, Any]:
+        now = _utc_now()
+
+        payload["status"] = status
+        payload[
+            "stage_performed"
+        ] = stage_performed
+        payload[
+            "apply_error"
+        ] = reason
+        payload[
+            "updated_at"
+        ] = now
+
+        payload.setdefault(
+            "history",
+            [],
+        ).append(
+            self._event(
+                status,
+                reason=reason,
+            )
+        )
+
+        self._save(payload)
+
+        return self._public(
+            payload
+        )
+
+    def _recover_incomplete(
+        self,
+    ) -> None:
+        for path in self.root.glob(
+            "GST-*.json"
+        ):
+            try:
+                payload = json.loads(
+                    path.read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except (
+                OSError,
+                json.JSONDecodeError,
+            ):
+                continue
+
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                continue
+
+            if (
+                payload.get(
+                    "protocol"
+                )
+                != GIT_STAGE_PROTOCOL
+                or payload.get(
+                    "status"
+                )
+                != "APPLYING"
+            ):
+                continue
+
+            stage_id = str(
+                payload.get("id")
+                or ""
+            )
+
+            snapshot = payload.get(
+                "snapshot"
+            )
+
+            if not isinstance(
+                snapshot,
+                dict,
+            ):
+                continue
+
+            git_dir_raw = str(
+                snapshot.get(
+                    "git_dir"
+                )
+                or ""
+            ).strip()
+
+            before_sha = str(
+                payload.get(
+                    "apply_before_index_sha256"
+                )
+                or ""
+            )
+
+            candidate_sha = str(
+                payload.get(
+                    "apply_candidate_index_sha256"
+                )
+                or ""
+            )
+
+            if (
+                not git_dir_raw
+                or not before_sha
+                or not candidate_sha
+            ):
+                continue
+
+            git_dir = Path(
+                git_dir_raw
+            ).expanduser().resolve()
+
+            index_path = (
+                git_dir / "index"
+            )
+
+            lock_path = (
+                git_dir / "index.lock"
+            )
+
+            try:
+                current_sha = (
+                    _sha256_file(
+                        index_path
+                    )
+                    if index_path.exists()
+                    else ""
+                )
+
+                lock_sha = (
+                    _sha256_file(
+                        lock_path
+                    )
+                    if (
+                        lock_path.exists()
+                        and lock_path.is_file()
+                    )
+                    else ""
+                )
+
+                if (
+                    current_sha
+                    == candidate_sha
+                ):
+                    if (
+                        lock_sha
+                        == candidate_sha
+                    ):
+                        lock_path.unlink(
+                            missing_ok=True
+                        )
+
+                    now = _utc_now()
+
+                    payload["status"] = (
+                        "APPLIED"
+                    )
+                    payload[
+                        "stage_performed"
+                    ] = True
+                    payload[
+                        "applied_at"
+                    ] = now
+                    payload[
+                        "updated_at"
+                    ] = now
+                    payload[
+                        "apply_after_index_sha256"
+                    ] = candidate_sha
+                    payload[
+                        "recovered_after_restart"
+                    ] = True
+
+                    payload.setdefault(
+                        "history",
+                        [],
+                    ).append(
+                        self._event(
+                            "APPLIED_RECOVERED"
+                        )
+                    )
+
+                    self._save(
+                        payload
+                    )
+
+                    self._cleanup_transaction(
+                        stage_id
+                    )
+
+                    continue
+
+                if (
+                    current_sha
+                    == before_sha
+                ):
+                    if lock_path.exists():
+                        if (
+                            lock_sha
+                            == candidate_sha
+                        ):
+                            lock_path.unlink(
+                                missing_ok=True
+                            )
+                        else:
+                            self._mark_apply_failure(
+                                payload,
+                                status=(
+                                    "RECOVERY_CONFLICT"
+                                ),
+                                reason=(
+                                    "Foreign Git index "
+                                    "lock detected during "
+                                    "recovery"
+                                ),
+                                stage_performed=False,
+                            )
+                            continue
+
+                    self._mark_apply_failure(
+                        payload,
+                        status=(
+                            "APPLY_FAILED_RECOVERED"
+                        ),
+                        reason=(
+                            "Interrupted before "
+                            "Git index commit"
+                        ),
+                        stage_performed=False,
+                    )
+
+                    self._cleanup_transaction(
+                        stage_id
+                    )
+
+                    continue
+
+                self._mark_apply_failure(
+                    payload,
+                    status=(
+                        "RECOVERY_CONFLICT"
+                    ),
+                    reason=(
+                        "Git index no longer "
+                        "matches the pre-apply "
+                        "or candidate fingerprint"
+                    ),
+                    stage_performed=True,
+                )
+
+            except Exception:
+                # Never make Gateway startup
+                # destructive because recovery
+                # evidence itself is malformed.
+                continue
 
     def _mark_stale(
         self,
@@ -1494,11 +2121,788 @@ class GitStageProposalStore:
     def apply(
         self,
         stage_id: str,
+        *,
+        confirm_stage: bool = False,
     ) -> dict[str, Any]:
-        del stage_id
+        with self._lock:
+            payload = self._load(
+                stage_id
+            )
 
-        raise GitStageStateError(
-            "Git staging apply is "
-            "intentionally unavailable "
-            "in P0.6E.2A"
-        )
+            if (
+                payload.get(
+                    "protocol"
+                )
+                != GIT_STAGE_PROTOCOL
+            ):
+                raise GitStageStateError(
+                    "Legacy or foreign "
+                    "Git staging proposal "
+                    "cannot be applied"
+                )
+
+            if (
+                payload.get("status")
+                != "APPROVED"
+            ):
+                raise GitStageStateError(
+                    "Only APPROVED Git "
+                    "staging proposals "
+                    "can be applied"
+                )
+
+            if confirm_stage is not True:
+                raise GitStageStateError(
+                    "Git staging apply "
+                    "requires literal "
+                    "confirm_stage=true"
+                )
+
+            try:
+                current = self._snapshot(
+                    workspace_id=str(
+                        payload[
+                            "workspace_id"
+                        ]
+                    ),
+                    paths=list(
+                        payload[
+                            "paths"
+                        ]
+                    ),
+                )
+
+            except (
+                ValueError,
+                PermissionError,
+                FileNotFoundError,
+                TimeoutError,
+            ) as exc:
+                reason = (
+                    "Git staging target "
+                    "became invalid after "
+                    "approval: "
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+
+                public = (
+                    self._mark_stale(
+                        payload,
+                        reason,
+                    )
+                )
+
+                raise (
+                    GitStageConflictError(
+                        reason,
+                        public,
+                    )
+                ) from exc
+
+            if (
+                current[
+                    "snapshot_sha256"
+                ]
+                != payload.get(
+                    "snapshot_sha256"
+                )
+            ):
+                reason = (
+                    "Git index, worktree, "
+                    "attributes, config, "
+                    "or runner changed "
+                    "after approval"
+                )
+
+                public = (
+                    self._mark_stale(
+                        payload,
+                        reason,
+                    )
+                )
+
+                raise GitStageConflictError(
+                    reason,
+                    public,
+                )
+
+            repository_root = Path(
+                str(
+                    current[
+                        "repository_root"
+                    ]
+                )
+            ).resolve()
+
+            git_dir = Path(
+                str(
+                    current[
+                        "git_dir"
+                    ]
+                )
+            ).resolve()
+
+            index_path = (
+                git_dir / "index"
+            )
+
+            before_sha = str(
+                current[
+                    "index"
+                ]["sha256"]
+                or ""
+            )
+
+            if (
+                not before_sha
+                or not index_path.exists()
+            ):
+                raise GitStageApplyError(
+                    "Git index disappeared "
+                    "before apply",
+                    self._public(
+                        payload
+                    ),
+                )
+
+            before_raw = (
+                index_path.read_bytes()
+            )
+
+            # Preserve the real index timestamp
+            # on the isolated candidate index.
+            #
+            # Git's racy-clean protection uses
+            # the index mtime when deciding
+            # whether a same-size, rapidly
+            # modified tracked file must be
+            # re-hashed. Giving the cloned
+            # GIT_INDEX_FILE a fresh mtime can
+            # incorrectly make such a path look
+            # clean to `git add`.
+            index_stat = (
+                index_path.stat()
+            )
+
+            if (
+                _sha256_bytes(
+                    before_raw
+                )
+                != before_sha
+            ):
+                reason = (
+                    "Git index changed "
+                    "during apply preparation"
+                )
+
+                public = (
+                    self._mark_stale(
+                        payload,
+                        reason,
+                    )
+                )
+
+                raise GitStageConflictError(
+                    reason,
+                    public,
+                )
+
+            mode = int(
+                current[
+                    "index"
+                ].get(
+                    "mode"
+                )
+                or 0o644
+            )
+
+            paths = list(
+                payload["paths"]
+            )
+
+            git_path = Path(
+                str(
+                    current[
+                        "runner"
+                    ]["path"]
+                )
+            )
+
+            backup_path, candidate_path = (
+                self._transaction_paths(
+                    stage_id
+                )
+            )
+
+            self._write_private_bytes(
+                backup_path,
+                before_raw,
+            )
+
+            self._write_private_bytes(
+                candidate_path,
+                before_raw,
+            )
+
+            # The candidate is byte-for-byte a
+            # clone of the authorized index, so
+            # preserve that index's timestamps
+            # before asking Git to mutate the
+            # isolated GIT_INDEX_FILE.
+            os.utime(
+                candidate_path,
+                ns=(
+                    index_stat.st_atime_ns,
+                    index_stat.st_mtime_ns,
+                ),
+            )
+
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix=(
+                        "maestro-git-stage-"
+                        "apply-"
+                    )
+                ) as td:
+                    env = _environment(
+                        git_path=git_path,
+                        private_home=Path(td),
+                    )
+
+                    env[
+                        "GIT_LITERAL_PATHSPECS"
+                    ] = "1"
+
+                    (
+                        before_inventory,
+                        before_inventory_result,
+                    ) = self._index_inventory(
+                        repository_root=(
+                            repository_root
+                        ),
+                        git_path=git_path,
+                        env=env,
+                    )
+
+                    candidate_env = dict(
+                        env
+                    )
+
+                    candidate_env[
+                        "GIT_INDEX_FILE"
+                    ] = str(
+                        candidate_path
+                    )
+
+                    git_add_result = _call(
+                        git_path=git_path,
+                        cwd=repository_root,
+                        env=candidate_env,
+                        args=[
+                            "add",
+                            "--",
+                            *paths,
+                        ],
+                        timeout_ms=10_000,
+                    )
+
+                    _require_success(
+                        git_add_result,
+                        operation=(
+                            "Governed Git staging"
+                        ),
+                    )
+
+                    (
+                        after_inventory,
+                        after_inventory_result,
+                    ) = self._index_inventory(
+                        repository_root=(
+                            repository_root
+                        ),
+                        git_path=git_path,
+                        env=candidate_env,
+                    )
+
+            except Exception as exc:
+                reason = (
+                    "Git staging candidate "
+                    "preparation failed: "
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+
+                public = (
+                    self._mark_apply_failure(
+                        payload,
+                        status="APPLY_FAILED",
+                        reason=reason,
+                        stage_performed=False,
+                    )
+                )
+
+                self._cleanup_transaction(
+                    stage_id
+                )
+
+                raise GitStageApplyError(
+                    reason,
+                    public,
+                ) from exc
+
+            changed_paths = (
+                self._changed_index_paths(
+                    before_inventory,
+                    after_inventory,
+                )
+            )
+
+            expected_paths = sorted(
+                set(paths)
+            )
+
+            if (
+                changed_paths
+                != expected_paths
+            ):
+                reason = (
+                    "Candidate Git index "
+                    "changed unexpected paths; "
+                    f"expected={expected_paths!r}, "
+                    f"actual={changed_paths!r}"
+                )
+
+                public = (
+                    self._mark_apply_failure(
+                        payload,
+                        status="APPLY_FAILED",
+                        reason=reason,
+                        stage_performed=False,
+                    )
+                )
+
+                self._cleanup_transaction(
+                    stage_id
+                )
+
+                raise GitStageApplyError(
+                    reason,
+                    public,
+                )
+
+            candidate_raw = (
+                candidate_path.read_bytes()
+            )
+
+            candidate_sha = (
+                _sha256_bytes(
+                    candidate_raw
+                )
+            )
+
+            if candidate_sha == before_sha:
+                reason = (
+                    "Candidate Git index "
+                    "contains no effective "
+                    "change"
+                )
+
+                public = (
+                    self._mark_apply_failure(
+                        payload,
+                        status="APPLY_FAILED",
+                        reason=reason,
+                        stage_performed=False,
+                    )
+                )
+
+                self._cleanup_transaction(
+                    stage_id
+                )
+
+                raise GitStageApplyError(
+                    reason,
+                    public,
+                )
+
+            # Candidate preparation reads the
+            # worktree after the approval
+            # snapshot. Revalidate the complete
+            # governed state once more before
+            # entering APPLYING or touching the
+            # real Git index.
+            try:
+                post_candidate_snapshot = (
+                    self._snapshot(
+                        workspace_id=str(
+                            payload[
+                                "workspace_id"
+                            ]
+                        ),
+                        paths=list(
+                            payload[
+                                "paths"
+                            ]
+                        ),
+                    )
+                )
+
+            except (
+                ValueError,
+                PermissionError,
+                FileNotFoundError,
+                TimeoutError,
+            ) as exc:
+                reason = (
+                    "Git staging state changed "
+                    "during candidate "
+                    "preparation: "
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+
+                public = (
+                    self._mark_stale(
+                        payload,
+                        reason,
+                    )
+                )
+
+                self._cleanup_transaction(
+                    stage_id
+                )
+
+                raise (
+                    GitStageConflictError(
+                        reason,
+                        public,
+                    )
+                ) from exc
+
+            if (
+                post_candidate_snapshot[
+                    "snapshot_sha256"
+                ]
+                != payload.get(
+                    "snapshot_sha256"
+                )
+            ):
+                reason = (
+                    "Git index, worktree, "
+                    "attributes, config, "
+                    "or runner changed during "
+                    "candidate staging"
+                )
+
+                public = (
+                    self._mark_stale(
+                        payload,
+                        reason,
+                    )
+                )
+
+                self._cleanup_transaction(
+                    stage_id
+                )
+
+                raise GitStageConflictError(
+                    reason,
+                    public,
+                )
+
+            now = _utc_now()
+
+            payload[
+                "status"
+            ] = "APPLYING"
+
+            payload[
+                "apply_started_at"
+            ] = now
+
+            payload[
+                "updated_at"
+            ] = now
+
+            payload[
+                "apply_protocol"
+            ] = GIT_STAGE_PROTOCOL
+
+            payload[
+                "apply_confirmation"
+            ] = True
+
+            payload[
+                "apply_before_index_sha256"
+            ] = before_sha
+
+            payload[
+                "apply_candidate_index_sha256"
+            ] = candidate_sha
+
+            payload[
+                "apply_changed_paths"
+            ] = changed_paths
+
+            payload[
+                "apply_git_result"
+            ] = git_add_result
+
+            payload[
+                "apply_before_inventory_sha256"
+            ] = before_inventory_result[
+                "stdout_sha256"
+            ]
+
+            payload[
+                "apply_after_inventory_sha256"
+            ] = after_inventory_result[
+                "stdout_sha256"
+            ]
+
+            payload.setdefault(
+                "history",
+                [],
+            ).append(
+                self._event(
+                    "APPLY_STARTED"
+                )
+            )
+
+            self._save(payload)
+
+            lock_path = (
+                git_dir / "index.lock"
+            )
+
+            try:
+                self._write_index_lock(
+                    lock_path,
+                    candidate_raw,
+                    mode=mode,
+                )
+
+            except FileExistsError as exc:
+                payload[
+                    "status"
+                ] = "APPROVED"
+
+                payload[
+                    "updated_at"
+                ] = _utc_now()
+
+                payload.setdefault(
+                    "history",
+                    [],
+                ).append(
+                    self._event(
+                        "APPLY_DEFERRED",
+                        reason=(
+                            "Git index is busy"
+                        ),
+                    )
+                )
+
+                self._save(payload)
+
+                self._cleanup_transaction(
+                    stage_id
+                )
+
+                raise GitStageConflictError(
+                    "Git index is busy; "
+                    "apply was not performed",
+                    self._public(
+                        payload
+                    ),
+                ) from exc
+
+            try:
+                if (
+                    not index_path.exists()
+                    or _sha256_file(
+                        index_path
+                    )
+                    != before_sha
+                ):
+                    try:
+                        lock_path.unlink(
+                            missing_ok=True
+                        )
+                    except OSError:
+                        pass
+
+                    reason = (
+                        "Git index changed "
+                        "after candidate "
+                        "verification"
+                    )
+
+                    public = (
+                        self._mark_stale(
+                            payload,
+                            reason,
+                        )
+                    )
+
+                    self._cleanup_transaction(
+                        stage_id
+                    )
+
+                    raise GitStageConflictError(
+                        reason,
+                        public,
+                    )
+
+                os.replace(
+                    lock_path,
+                    index_path,
+                )
+
+                _fsync_directory(
+                    git_dir
+                )
+
+                self._verify_committed_index(
+                    index_path=index_path,
+                    expected_sha256=(
+                        candidate_sha
+                    ),
+                )
+
+            except GitStageConflictError:
+                raise
+
+            except Exception as exc:
+                try:
+                    if (
+                        lock_path.exists()
+                        and _sha256_file(
+                            lock_path
+                        )
+                        == candidate_sha
+                    ):
+                        lock_path.unlink(
+                            missing_ok=True
+                        )
+                except OSError:
+                    pass
+
+                current_sha = (
+                    _sha256_file(
+                        index_path
+                    )
+                    if index_path.exists()
+                    else ""
+                )
+
+                rolled_back = False
+
+                if (
+                    current_sha
+                    == candidate_sha
+                ):
+                    rolled_back = (
+                        self._rollback_index(
+                            index_path=index_path,
+                            before_raw=before_raw,
+                            before_sha256=before_sha,
+                            candidate_sha256=(
+                                candidate_sha
+                            ),
+                            mode=mode,
+                        )
+                    )
+
+                reason = (
+                    "Git staging commit "
+                    "failed: "
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+
+                if rolled_back:
+                    status = (
+                        "APPLY_FAILED_ROLLED_BACK"
+                    )
+                    stage_performed = False
+                elif (
+                    index_path.exists()
+                    and _sha256_file(
+                        index_path
+                    )
+                    == before_sha
+                ):
+                    status = "APPLY_FAILED"
+                    stage_performed = False
+                else:
+                    status = (
+                        "RECOVERY_CONFLICT"
+                    )
+                    stage_performed = True
+
+                public = (
+                    self._mark_apply_failure(
+                        payload,
+                        status=status,
+                        reason=reason,
+                        stage_performed=(
+                            stage_performed
+                        ),
+                    )
+                )
+
+                if (
+                    status
+                    != "RECOVERY_CONFLICT"
+                ):
+                    self._cleanup_transaction(
+                        stage_id
+                    )
+
+                raise GitStageApplyError(
+                    reason,
+                    public,
+                ) from exc
+
+            now = _utc_now()
+
+            payload[
+                "status"
+            ] = "APPLIED"
+
+            payload[
+                "stage_performed"
+            ] = True
+
+            payload[
+                "applied_at"
+            ] = now
+
+            payload[
+                "updated_at"
+            ] = now
+
+            payload[
+                "apply_after_index_sha256"
+            ] = candidate_sha
+
+            payload.setdefault(
+                "history",
+                [],
+            ).append(
+                self._event(
+                    "APPLIED"
+                )
+            )
+
+            self._save(payload)
+
+            self._cleanup_transaction(
+                stage_id
+            )
+
+            return self._public(
+                payload
+            )

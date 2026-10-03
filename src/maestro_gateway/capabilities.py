@@ -60,7 +60,7 @@ class CapabilityRegistry:
         elif workspace_kind == "directory":
             git_stage_state = (
                 "available_governed_"
-                "proposal_approval_only"
+                "approved_explicit_apply"
             )
         else:
             git_stage_state = (
@@ -187,14 +187,14 @@ class CapabilityRegistry:
                 "git.stage",
                 "development",
                 git_stage_state,
-                "Create, inspect, approve, or reject an explicit-path Git staging proposal. Approval does not modify the index and apply is unavailable in P0.6E.2A.",
+                "Create, inspect, approve, reject, and explicitly apply an exact-path Git staging proposal. Approval remains state-only; apply requires a separate literal confirmation and transactionally updates only the governed index paths.",
                 approval="user",
             ),
             Capability(
                 "git.execute",
                 "development",
-                "not_available_general_git_mutation_p0_6e2a",
-                "General arbitrary Git mutation remains unavailable in P0.6E.2A.",
+                "not_available_general_git_mutation_p0_6e2b",
+                "General arbitrary Git mutation remains unavailable in P0.6E.2B; only governed explicit-path staging apply is exposed.",
                 approval="future_governed_approval",
             ),
             Capability(

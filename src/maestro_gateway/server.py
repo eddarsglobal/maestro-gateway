@@ -31,6 +31,7 @@ from .git_inspection import GIT_MODE, GIT_PROTOCOL
 from .git_staging import (
     GIT_STAGE_MODE,
     GIT_STAGE_PROTOCOL,
+    GitStageApplyError,
     GitStageConflictError,
     GitStageProposalStore,
     GitStageStateError,
@@ -1375,6 +1376,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 in {
                     "approve",
                     "reject",
+                    "apply",
                 }
             ):
                 if not self._require_session():
@@ -1395,7 +1397,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             )
                         )
 
-                    else:
+                    elif action == "reject":
                         proposal = (
                             self.server
                             .git_stages
@@ -1406,6 +1408,28 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                         "reason"
                                     )
                                 ),
+                            )
+                        )
+
+                    else:
+                        if (
+                            payload.get(
+                                "confirm_stage"
+                            )
+                            is not True
+                        ):
+                            raise ValueError(
+                                "Git staging apply "
+                                "requires literal "
+                                "confirm_stage=true"
+                            )
+
+                        proposal = (
+                            self.server
+                            .git_stages
+                            .apply(
+                                stage_id,
+                                confirm_stage=True,
                             )
                         )
 
@@ -1446,6 +1470,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                 "state"
                             ),
                             "message": str(exc),
+                        },
+                    )
+                    return
+
+                except GitStageApplyError as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {
+                            "error": (
+                                "git_stage_apply_failed"
+                            ),
+                            "message": str(exc),
+                            "proposal": (
+                                exc.proposal
+                            ),
                         },
                     )
                     return
@@ -2074,7 +2113,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6E.2A"
+        "MAESTRO LOCAL GATEWAY — P0.6E.2B"
     )
     print("=" * 72)
     print(
