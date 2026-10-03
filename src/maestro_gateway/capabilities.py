@@ -53,6 +53,21 @@ class CapabilityRegistry:
                 "not_available_requires_directory_workspace"
             )
 
+        if not workspace_active:
+            git_stage_state = (
+                "available_requires_workspace"
+            )
+        elif workspace_kind == "directory":
+            git_stage_state = (
+                "available_governed_"
+                "proposal_approval_only"
+            )
+        else:
+            git_stage_state = (
+                "not_available_requires_"
+                "directory_workspace"
+            )
+
         capabilities = [
             Capability(
                 "conversation.context",
@@ -169,10 +184,17 @@ class CapabilityRegistry:
                 approval="workspace_authorization",
             ),
             Capability(
+                "git.stage",
+                "development",
+                git_stage_state,
+                "Create, inspect, approve, or reject an explicit-path Git staging proposal. Approval does not modify the index and apply is unavailable in P0.6E.2A.",
+                approval="user",
+            ),
+            Capability(
                 "git.execute",
                 "development",
-                "not_available_mutation_p0_6e1",
-                "Mutating Git execution remains unavailable in P0.6E.1.",
+                "not_available_general_git_mutation_p0_6e2a",
+                "General arbitrary Git mutation remains unavailable in P0.6E.2A.",
                 approval="future_governed_approval",
             ),
             Capability(

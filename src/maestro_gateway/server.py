@@ -28,6 +28,13 @@ from .execution import (
     ExecutionStateError,
 )
 from .git_inspection import GIT_MODE, GIT_PROTOCOL
+from .git_staging import (
+    GIT_STAGE_MODE,
+    GIT_STAGE_PROTOCOL,
+    GitStageConflictError,
+    GitStageProposalStore,
+    GitStageStateError,
+)
 from .mission import GovernedDirectMissionRunner
 from .ollama import discover_ollama
 from .terminal import (
@@ -158,6 +165,11 @@ class GatewayHTTPServer(ThreadingHTTPServer):
 
         self.executions = ExecutionProposalStore(
             user_root / "executions",
+            self.workspaces,
+        )
+
+        self.git_stages = GitStageProposalStore(
+            user_root / "git-stages",
             self.workspaces,
         )
 
@@ -450,6 +462,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "terminal_shell": TERMINAL_SHELL,
                     "git_protocol": GIT_PROTOCOL,
                     "git_execution": GIT_MODE,
+                    "git_stage_protocol": GIT_STAGE_PROTOCOL,
+                    "git_stage_execution": GIT_STAGE_MODE,
                     "execution_protocol": EXECUTION_PROTOCOL,
                     "project_execution": "approved_explicit_execute",
                     "conversation_storage": (
@@ -471,6 +485,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "/conversations",
                         "/workspaces",
                         "/changes",
+                        "/git-stages",
                     ],
                 },
             )
@@ -518,6 +533,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "terminal_shell": TERMINAL_SHELL,
                     "git_protocol": GIT_PROTOCOL,
                     "git_execution": GIT_MODE,
+                    "git_stage_protocol": GIT_STAGE_PROTOCOL,
+                    "git_stage_execution": GIT_STAGE_MODE,
                     "execution_protocol": EXECUTION_PROTOCOL,
                     "project_execution": "approved_explicit_execute",
                     "conversation_storage": (
@@ -636,6 +653,77 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.OK,
                     payload,
+                )
+                return
+
+        if path == "/git-stages":
+            if not self._require_session():
+                return
+
+            workspace_id = query.get(
+                "workspace_id",
+                [None],
+            )[0]
+
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "protocol": GIT_STAGE_PROTOCOL,
+                    "mode": GIT_STAGE_MODE,
+                    "git_stages": (
+                        self.server
+                        .git_stages
+                        .list(
+                            workspace_id=workspace_id
+                        )
+                    ),
+                },
+            )
+            return
+
+        if path.startswith("/git-stages/"):
+            if not self._require_session():
+                return
+
+            parts = path.strip("/").split("/")
+
+            if len(parts) == 2:
+                stage_id = parts[1]
+
+                try:
+                    proposal = (
+                        self.server
+                        .git_stages
+                        .get(stage_id)
+                    )
+
+                except KeyError:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {
+                            "error": (
+                                "git_stage_not_found"
+                            ),
+                            "stage_id": stage_id,
+                        },
+                    )
+                    return
+
+                except ValueError as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": (
+                                "invalid_git_stage_id"
+                            ),
+                            "message": str(exc),
+                        },
+                    )
+                    return
+
+                self._send_json(
+                    HTTPStatus.OK,
+                    proposal,
                 )
                 return
 
@@ -1207,6 +1295,174 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                         {
                             "error": "execution_action_rejected",
+                            "message": str(exc),
+                        },
+                    )
+                    return
+
+                self._send_json(
+                    HTTPStatus.OK,
+                    proposal,
+                )
+                return
+
+        if path == "/git-stages/propose":
+            if not self._require_session():
+                return
+
+            try:
+                payload = self._read_json()
+
+                proposal = (
+                    self.server
+                    .git_stages
+                    .propose(
+                        workspace_id=str(
+                            payload.get(
+                                "workspace_id"
+                            )
+                            or ""
+                        ),
+                        paths=payload.get(
+                            "paths"
+                        ),
+                    )
+                )
+
+            except KeyError as exc:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "error": (
+                            "workspace_not_found"
+                        ),
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            except (
+                ValueError,
+                PermissionError,
+                FileNotFoundError,
+                TimeoutError,
+            ) as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": (
+                            "git_stage_proposal_"
+                            "rejected"
+                        ),
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            self._send_json(
+                HTTPStatus.CREATED,
+                proposal,
+            )
+            return
+
+        if path.startswith("/git-stages/"):
+            parts = path.strip("/").split("/")
+
+            if (
+                len(parts) == 3
+                and parts[0] == "git-stages"
+                and parts[2]
+                in {
+                    "approve",
+                    "reject",
+                }
+            ):
+                if not self._require_session():
+                    return
+
+                stage_id = parts[1]
+                action = parts[2]
+
+                try:
+                    payload = self._read_json()
+
+                    if action == "approve":
+                        proposal = (
+                            self.server
+                            .git_stages
+                            .approve(
+                                stage_id
+                            )
+                        )
+
+                    else:
+                        proposal = (
+                            self.server
+                            .git_stages
+                            .reject(
+                                stage_id,
+                                reason=(
+                                    payload.get(
+                                        "reason"
+                                    )
+                                ),
+                            )
+                        )
+
+                except KeyError:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {
+                            "error": (
+                                "git_stage_not_found"
+                            ),
+                            "stage_id": stage_id,
+                        },
+                    )
+                    return
+
+                except GitStageConflictError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": (
+                                "git_stage_proposal_"
+                                "stale"
+                            ),
+                            "message": str(exc),
+                            "proposal": (
+                                exc.proposal
+                            ),
+                        },
+                    )
+                    return
+
+                except GitStageStateError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": (
+                                "invalid_git_stage_"
+                                "state"
+                            ),
+                            "message": str(exc),
+                        },
+                    )
+                    return
+
+                except (
+                    ValueError,
+                    PermissionError,
+                    FileNotFoundError,
+                    TimeoutError,
+                ) as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": (
+                                "git_stage_action_"
+                                "rejected"
+                            ),
                             "message": str(exc),
                         },
                     )
@@ -1818,7 +2074,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6E.1"
+        "MAESTRO LOCAL GATEWAY — P0.6E.2A"
     )
     print("=" * 72)
     print(
