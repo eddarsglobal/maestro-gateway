@@ -1616,12 +1616,40 @@ class ExecutionProposalStore:
             snapshot,
         )
 
+    def _load_active_execution_attempt(
+        self,
+        run_id: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        payload = self._load(
+            run_id
+        )
+
+        if (
+            payload.get("status")
+            != "EXECUTION_STARTED"
+            or payload.get(
+                "execution_attempt_id"
+            )
+            != attempt_id
+        ):
+            raise ExecutionStateError(
+                "Execution attempt state "
+                "changed before finalization"
+            )
+
+        return payload
+
     def execute(
         self,
         run_id: str,
         *,
         confirm_execution: bool = False,
     ) -> dict[str, Any]:
+        # Phase 1:
+        # validate and persist the immutable
+        # execution attempt while holding the
+        # store lock.
         with self._lock:
             payload = self._load(
                 run_id
@@ -1724,9 +1752,20 @@ class ExecutionProposalStore:
 
             started = _now()
 
+            attempt_id = (
+                "ATT-"
+                + secrets.token_hex(
+                    8
+                ).upper()
+            )
+
             payload[
                 "status"
             ] = "EXECUTION_STARTED"
+
+            payload[
+                "execution_attempt_id"
+            ] = attempt_id
 
             payload[
                 "execution_started_at"
@@ -1799,22 +1838,43 @@ class ExecutionProposalStore:
 
             self._save(payload)
 
-            try:
-                result = (
-                    _run_bounded_process(
-                        argv=argv,
-                        cwd=root,
-                        env=environment,
-                        timeout_ms=int(
-                            definition[
-                                "timeout_ms"
-                            ]
-                        ),
+            workspace_id = str(
+                payload[
+                    "workspace_id"
+                ]
+            )
+
+            timeout_ms = int(
+                definition[
+                    "timeout_ms"
+                ]
+            )
+
+        # Phase 2:
+        # project execution is deliberately
+        # outside the global proposal-store
+        # lock. Read-only get/list operations
+        # remain available while it runs.
+        try:
+            result = (
+                _run_bounded_process(
+                    argv=argv,
+                    cwd=root,
+                    env=environment,
+                    timeout_ms=timeout_ms,
+                )
+            )
+
+        except Exception as exc:
+            finished = _now()
+
+            with self._lock:
+                payload = (
+                    self._load_active_execution_attempt(
+                        run_id,
+                        attempt_id,
                     )
                 )
-
-            except Exception as exc:
-                finished = _now()
 
                 payload[
                     "status"
@@ -1851,6 +1911,62 @@ class ExecutionProposalStore:
                 self._save(payload)
 
                 return dict(payload)
+
+        # The post-execution workspace scan can
+        # also be comparatively expensive, so
+        # it remains outside the store lock.
+        post_snapshot_error = None
+        after_snapshot = None
+
+        try:
+            after_snapshot = (
+                self._detector
+                .snapshot(
+                    workspace_id
+                )
+            )
+
+        except Exception as exc:
+            post_snapshot_error = (
+                f"{type(exc).__name__}: "
+                f"{exc}"
+            )
+
+        if result[
+            "timed_out"
+        ]:
+            final_status = (
+                "TIMED_OUT"
+            )
+
+        elif (
+            result[
+                "exit_code"
+            ]
+            == 0
+        ):
+            final_status = (
+                "PASSED"
+            )
+
+        else:
+            final_status = (
+                "FAILED"
+            )
+
+        finished = _now()
+
+        # Phase 3:
+        # reacquire the lock and prove this is
+        # still the same EXECUTION_STARTED
+        # attempt before writing any result.
+        with self._lock:
+            payload = (
+                self._load_active_execution_attempt(
+                    run_id,
+                    attempt_id,
+                )
+            )
 
             payload.update(
                 {
@@ -1927,25 +2043,6 @@ class ExecutionProposalStore:
                 }
             )
 
-            post_snapshot_error = None
-            after_snapshot = None
-
-            try:
-                after_snapshot = (
-                    self._detector
-                    .snapshot(
-                        payload[
-                            "workspace_id"
-                        ]
-                    )
-                )
-
-            except Exception as exc:
-                post_snapshot_error = (
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                )
-
             if (
                 after_snapshot
                 is not None
@@ -1983,30 +2080,6 @@ class ExecutionProposalStore:
                 ] = (
                     post_snapshot_error
                 )
-
-            if result[
-                "timed_out"
-            ]:
-                final_status = (
-                    "TIMED_OUT"
-                )
-
-            elif (
-                result[
-                    "exit_code"
-                ]
-                == 0
-            ):
-                final_status = (
-                    "PASSED"
-                )
-
-            else:
-                final_status = (
-                    "FAILED"
-                )
-
-            finished = _now()
 
             payload["status"] = (
                 final_status
