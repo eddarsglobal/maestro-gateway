@@ -68,6 +68,21 @@ class CapabilityRegistry:
                 "directory_workspace"
             )
 
+        if not workspace_active:
+            git_commit_state = (
+                "available_requires_workspace"
+            )
+        elif workspace_kind == "directory":
+            git_commit_state = (
+                "available_governed_"
+                "proposal_approval_only"
+            )
+        else:
+            git_commit_state = (
+                "not_available_requires_"
+                "directory_workspace"
+            )
+
         capabilities = [
             Capability(
                 "conversation.context",
@@ -191,10 +206,17 @@ class CapabilityRegistry:
                 approval="user",
             ),
             Capability(
+                "git.commit",
+                "development",
+                git_commit_state,
+                "Create, inspect, approve, or reject a governed Git commit proposal bound to the exact HEAD, branch, index, staged inventory, message, config, and trusted Git runner. Approval is state-only; commit creation and ref mutation remain unavailable in P0.6E.3A.",
+                approval="user",
+            ),
+            Capability(
                 "git.execute",
                 "development",
-                "not_available_general_git_mutation_p0_6e2b",
-                "General arbitrary Git mutation remains unavailable in P0.6E.2B; only governed explicit-path staging apply is exposed.",
+                "not_available_general_git_mutation_p0_6e3a",
+                "General arbitrary Git mutation remains unavailable in P0.6E.3A. Governed explicit-path staging apply is available, and Git commit is proposal/approval-only with no commit or ref mutation.",
                 approval="future_governed_approval",
             ),
             Capability(

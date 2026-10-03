@@ -27,6 +27,13 @@ from .execution import (
     ExecutionStaleError,
     ExecutionStateError,
 )
+from .git_commit import (
+    GIT_COMMIT_MODE,
+    GIT_COMMIT_PROTOCOL,
+    GitCommitConflictError,
+    GitCommitProposalStore,
+    GitCommitStateError,
+)
 from .git_inspection import GIT_MODE, GIT_PROTOCOL
 from .git_staging import (
     GIT_STAGE_MODE,
@@ -171,6 +178,11 @@ class GatewayHTTPServer(ThreadingHTTPServer):
 
         self.git_stages = GitStageProposalStore(
             user_root / "git-stages",
+            self.workspaces,
+        )
+
+        self.git_commits = GitCommitProposalStore(
+            user_root / "git-commits",
             self.workspaces,
         )
 
@@ -465,6 +477,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "git_execution": GIT_MODE,
                     "git_stage_protocol": GIT_STAGE_PROTOCOL,
                     "git_stage_execution": GIT_STAGE_MODE,
+                    "git_commit_protocol": GIT_COMMIT_PROTOCOL,
+                    "git_commit_execution": GIT_COMMIT_MODE,
                     "execution_protocol": EXECUTION_PROTOCOL,
                     "project_execution": "approved_explicit_execute",
                     "conversation_storage": (
@@ -487,6 +501,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "/workspaces",
                         "/changes",
                         "/git-stages",
+                        "/git-commits",
                     ],
                 },
             )
@@ -536,6 +551,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "git_execution": GIT_MODE,
                     "git_stage_protocol": GIT_STAGE_PROTOCOL,
                     "git_stage_execution": GIT_STAGE_MODE,
+                    "git_commit_protocol": GIT_COMMIT_PROTOCOL,
+                    "git_commit_execution": GIT_COMMIT_MODE,
                     "execution_protocol": EXECUTION_PROTOCOL,
                     "project_execution": "approved_explicit_execute",
                     "conversation_storage": (
@@ -718,6 +735,92 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                 "invalid_git_stage_id"
                             ),
                             "message": str(exc),
+                        },
+                    )
+                    return
+
+                self._send_json(
+                    HTTPStatus.OK,
+                    proposal,
+                )
+                return
+
+        if path == "/git-commits":
+            if not self._require_session():
+                return
+
+            workspace_id = query.get(
+                "workspace_id",
+                [None],
+            )[0]
+
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "protocol": (
+                        GIT_COMMIT_PROTOCOL
+                    ),
+                    "mode": (
+                        GIT_COMMIT_MODE
+                    ),
+                    "git_commits": (
+                        self.server
+                        .git_commits
+                        .list(
+                            workspace_id=(
+                                workspace_id
+                            )
+                        )
+                    ),
+                },
+            )
+            return
+
+        if path.startswith(
+            "/git-commits/"
+        ):
+            if not self._require_session():
+                return
+
+            parts = (
+                path.strip("/")
+                .split("/")
+            )
+
+            if len(parts) == 2:
+                commit_id = parts[1]
+
+                try:
+                    proposal = (
+                        self.server
+                        .git_commits
+                        .get(commit_id)
+                    )
+
+                except KeyError:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {
+                            "error": (
+                                "git_commit_not_found"
+                            ),
+                            "commit_id": (
+                                commit_id
+                            ),
+                        },
+                    )
+                    return
+
+                except ValueError as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": (
+                                "invalid_git_commit_id"
+                            ),
+                            "message": str(
+                                exc
+                            ),
                         },
                     )
                     return
@@ -1296,6 +1399,187 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                         {
                             "error": "execution_action_rejected",
+                            "message": str(exc),
+                        },
+                    )
+                    return
+
+                self._send_json(
+                    HTTPStatus.OK,
+                    proposal,
+                )
+                return
+
+        if path == "/git-commits/propose":
+            if not self._require_session():
+                return
+
+            try:
+                payload = self._read_json()
+
+                proposal = (
+                    self.server
+                    .git_commits
+                    .propose(
+                        workspace_id=str(
+                            payload.get(
+                                "workspace_id"
+                            )
+                            or ""
+                        ),
+                        message=payload.get(
+                            "message"
+                        ),
+                    )
+                )
+
+            except KeyError as exc:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "error": (
+                            "workspace_not_found"
+                        ),
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            except (
+                ValueError,
+                PermissionError,
+                FileNotFoundError,
+                TimeoutError,
+            ) as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": (
+                            "git_commit_proposal_"
+                            "rejected"
+                        ),
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            self._send_json(
+                HTTPStatus.CREATED,
+                proposal,
+            )
+            return
+
+        if path.startswith(
+            "/git-commits/"
+        ):
+            parts = (
+                path.strip("/")
+                .split("/")
+            )
+
+            if (
+                len(parts) == 3
+                and parts[0]
+                == "git-commits"
+                and parts[2]
+                in {
+                    "approve",
+                    "reject",
+                }
+            ):
+                if not self._require_session():
+                    return
+
+                commit_id = parts[1]
+                action = parts[2]
+
+                try:
+                    payload = (
+                        self._read_json()
+                    )
+
+                    if action == "approve":
+                        proposal = (
+                            self.server
+                            .git_commits
+                            .approve(
+                                commit_id
+                            )
+                        )
+                    else:
+                        proposal = (
+                            self.server
+                            .git_commits
+                            .reject(
+                                commit_id,
+                                reason=(
+                                    payload.get(
+                                        "reason"
+                                    )
+                                ),
+                            )
+                        )
+
+                except KeyError:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {
+                            "error": (
+                                "git_commit_not_found"
+                            ),
+                            "commit_id": (
+                                commit_id
+                            ),
+                        },
+                    )
+                    return
+
+                except (
+                    GitCommitConflictError
+                ) as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": (
+                                "git_commit_proposal_"
+                                "stale"
+                            ),
+                            "message": str(exc),
+                            "proposal": (
+                                exc.proposal
+                            ),
+                        },
+                    )
+                    return
+
+                except (
+                    GitCommitStateError
+                ) as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": (
+                                "invalid_git_commit_"
+                                "state"
+                            ),
+                            "message": str(exc),
+                        },
+                    )
+                    return
+
+                except (
+                    ValueError,
+                    PermissionError,
+                    FileNotFoundError,
+                    TimeoutError,
+                ) as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": (
+                                "git_commit_action_"
+                                "rejected"
+                            ),
                             "message": str(exc),
                         },
                     )
@@ -2113,7 +2397,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6E.2B"
+        "MAESTRO LOCAL GATEWAY — P0.6E.3A"
     )
     print("=" * 72)
     print(
