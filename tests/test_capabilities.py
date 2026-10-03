@@ -126,3 +126,102 @@ class CapabilityRegistryTests(unittest.TestCase):
             index["terminal.run"]["status"],
             "not_available_requires_directory_workspace",
         )
+
+
+class GitInspectionCapabilityTests(
+    unittest.TestCase
+):
+    def index(
+        self,
+        *,
+        workspace_active,
+        workspace_kind=None,
+    ):
+        if (
+            workspace_active
+            and workspace_kind is None
+        ):
+            workspace_kind = "directory"
+
+        return {
+            row["capability_id"]: row
+            for row in (
+                CapabilityRegistry()
+                .snapshot(
+                    workspace_active=(
+                        workspace_active
+                    ),
+                    workspace_kind=(
+                        workspace_kind
+                    ),
+                )
+            )
+        }
+
+    def test_git_inspection_available_in_directory(
+        self,
+    ):
+        index = self.index(
+            workspace_active=True,
+        )
+
+        for capability in (
+            "git.status",
+            "git.diff",
+            "git.log",
+            "git.branch_current",
+        ):
+            self.assertEqual(
+                index[capability]["status"],
+                (
+                    "available_inspection_only_"
+                    "in_authorized_workspace"
+                ),
+            )
+
+            self.assertEqual(
+                index[capability][
+                    "approval"
+                ],
+                "workspace_authorization",
+            )
+
+    def test_git_inspection_requires_workspace(
+        self,
+    ):
+        index = self.index(
+            workspace_active=False,
+        )
+
+        self.assertEqual(
+            index["git.status"]["status"],
+            "available_requires_workspace",
+        )
+
+    def test_git_inspection_rejects_file_workspace(
+        self,
+    ):
+        index = self.index(
+            workspace_active=True,
+            workspace_kind="file",
+        )
+
+        self.assertEqual(
+            index["git.status"]["status"],
+            (
+                "not_available_requires_"
+                "directory_workspace"
+            ),
+        )
+
+    def test_git_mutation_remains_unavailable(
+        self,
+    ):
+        index = self.index(
+            workspace_active=True,
+        )
+
+        self.assertEqual(
+            index["git.execute"]["status"],
+            "not_available_mutation_p0_6e1",
+        )

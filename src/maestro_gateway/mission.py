@@ -262,6 +262,95 @@ def _normalize_tool_arguments(
             "max_depth": max(0, min(max_depth, 6)),
         }
 
+    if name in {
+        "git.status",
+        "git.branch_current",
+    }:
+        if arguments:
+            raise ValueError(
+                f"{name} does not accept arguments"
+            )
+
+        return {}
+
+    if name == "git.diff":
+        unknown = (
+            set(arguments)
+            - {"scope"}
+        )
+
+        if unknown:
+            raise ValueError(
+                "git.diff accepts only scope"
+            )
+
+        scope = str(
+            arguments.get("scope")
+            or "worktree"
+        ).strip()
+
+        if scope not in {
+            "worktree",
+            "staged",
+        }:
+            raise ValueError(
+                "git.diff scope must be "
+                "worktree or staged"
+            )
+
+        return {
+            "scope": scope,
+        }
+
+    if name == "git.log":
+        unknown = (
+            set(arguments)
+            - {"max_count"}
+        )
+
+        if unknown:
+            raise ValueError(
+                "git.log accepts only max_count"
+            )
+
+        raw_max_count = arguments.get(
+            "max_count",
+            10,
+        )
+
+        if isinstance(
+            raw_max_count,
+            bool,
+        ):
+            raise ValueError(
+                "git.log max_count must "
+                "be an integer"
+            )
+
+        try:
+            max_count = int(
+                raw_max_count
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ValueError(
+                "git.log max_count must "
+                "be an integer"
+            ) from exc
+
+        if not 1 <= max_count <= 50:
+            raise ValueError(
+                "git.log max_count must "
+                "be between 1 and 50"
+            )
+
+        return {
+            "max_count": max_count,
+        }
+
     if name == "terminal.run":
         raw_argv = arguments.get("argv")
 
@@ -352,7 +441,7 @@ def _normalize_tool_arguments(
         }
 
     raise ValueError(
-        f"Tool is not available in P0.6D.1: {name}"
+        f"Tool is not available in P0.6E.1: {name}"
     )
 
 
@@ -656,7 +745,9 @@ class GovernedDirectMissionRunner:
                     "</MAESTRO_TOOL>\n"
                     "MAESTRO executes the tool and returns "
                     "the result. Never invent a tool result. "
-                    "Mission tools are inspection-only in P0.6D.1: "
+                    "Mission tools are inspection-only in P0.6E.1. "
+                    "Git inspection tools are git.status, git.diff, git.log, "
+                    "and git.branch_current. "
                     "write/edit/delete and mutating terminal commands "
                     "are not available through this tool channel."
                 )

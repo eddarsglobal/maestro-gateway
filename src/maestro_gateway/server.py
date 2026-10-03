@@ -27,6 +27,7 @@ from .execution import (
     ExecutionStaleError,
     ExecutionStateError,
 )
+from .git_inspection import GIT_MODE, GIT_PROTOCOL
 from .mission import GovernedDirectMissionRunner
 from .ollama import discover_ollama
 from .terminal import (
@@ -447,6 +448,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "terminal_protocol": TERMINAL_PROTOCOL,
                     "terminal_execution": TERMINAL_MODE,
                     "terminal_shell": TERMINAL_SHELL,
+                    "git_protocol": GIT_PROTOCOL,
+                    "git_execution": GIT_MODE,
                     "execution_protocol": EXECUTION_PROTOCOL,
                     "project_execution": "approved_explicit_execute",
                     "conversation_storage": (
@@ -513,6 +516,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "terminal_protocol": TERMINAL_PROTOCOL,
                     "terminal_execution": TERMINAL_MODE,
                     "terminal_shell": TERMINAL_SHELL,
+                    "git_protocol": GIT_PROTOCOL,
+                    "git_execution": GIT_MODE,
                     "execution_protocol": EXECUTION_PROTOCOL,
                     "project_execution": "approved_explicit_execute",
                     "conversation_storage": (
@@ -1813,7 +1818,7 @@ def main() -> int:
 
     print("=" * 72)
     print(
-        "MAESTRO LOCAL GATEWAY — P0.6D.2B"
+        "MAESTRO LOCAL GATEWAY — P0.6E.1"
     )
     print("=" * 72)
     print(

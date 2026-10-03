@@ -91,3 +91,109 @@ class ToolContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GitToolContractTests(
+    unittest.TestCase
+):
+    def test_status_and_branch_take_no_arguments(
+        self,
+    ):
+        self.assertEqual(
+            _normalize_tool_arguments(
+                "git.status",
+                {},
+            ),
+            {},
+        )
+
+        self.assertEqual(
+            _normalize_tool_arguments(
+                "git.branch_current",
+                {},
+            ),
+            {},
+        )
+
+        with self.assertRaises(
+            ValueError
+        ):
+            _normalize_tool_arguments(
+                "git.status",
+                {
+                    "argv": [
+                        "status"
+                    ],
+                },
+            )
+
+    def test_diff_scope_is_normalized(
+        self,
+    ):
+        self.assertEqual(
+            _normalize_tool_arguments(
+                "git.diff",
+                {},
+            ),
+            {
+                "scope": "worktree",
+            },
+        )
+
+        self.assertEqual(
+            _normalize_tool_arguments(
+                "git.diff",
+                {
+                    "scope": "staged",
+                },
+            ),
+            {
+                "scope": "staged",
+            },
+        )
+
+    def test_diff_rejects_arbitrary_scope(
+        self,
+    ):
+        with self.assertRaises(
+            ValueError
+        ):
+            _normalize_tool_arguments(
+                "git.diff",
+                {
+                    "scope": "HEAD~10",
+                },
+            )
+
+    def test_log_max_count_is_bounded(
+        self,
+    ):
+        self.assertEqual(
+            _normalize_tool_arguments(
+                "git.log",
+                {
+                    "max_count": 7,
+                },
+            ),
+            {
+                "max_count": 7,
+            },
+        )
+
+    def test_log_rejects_invalid_count(
+        self,
+    ):
+        for value in (
+            0,
+            51,
+            True,
+        ):
+            with self.assertRaises(
+                ValueError
+            ):
+                _normalize_tool_arguments(
+                    "git.log",
+                    {
+                        "max_count": value,
+                    },
+                )

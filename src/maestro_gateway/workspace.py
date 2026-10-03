@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .git_inspection import inspect_git as inspect_git_repository
 from .terminal import run_inspection_command
 
 
@@ -766,6 +767,34 @@ class WorkspaceRegistry:
             **result,
         }
 
+    def inspect_git(
+        self,
+        workspace_id: str,
+        *,
+        operation: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        row, selected = self._scope(
+            workspace_id
+        )
+
+        if row["kind"] != "directory":
+            raise ValueError(
+                "Git inspection requires "
+                "an authorized directory workspace"
+            )
+
+        result = inspect_git_repository(
+            workspace_root=selected,
+            operation=operation,
+            options=arguments,
+        )
+
+        return {
+            "workspace_id": row["id"],
+            **result,
+        }
+
     def execute_tool(
         self,
         workspace_id: str,
@@ -799,6 +828,18 @@ class WorkspaceRegistry:
                 ),
             )
 
+        if name in {
+            "git.status",
+            "git.diff",
+            "git.log",
+            "git.branch_current",
+        }:
+            return self.inspect_git(
+                workspace_id,
+                operation=name,
+                arguments=arguments,
+            )
+
         if name == "terminal.run":
             return self.run_terminal(
                 workspace_id,
@@ -813,5 +854,5 @@ class WorkspaceRegistry:
             )
 
         raise ValueError(
-            f"Tool is not available in P0.6A: {name}"
+            f"Tool is not available in P0.6E.1: {name}"
         )
