@@ -5,7 +5,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import maestro_gateway.git_inspection as git_inspection_module
 from maestro_gateway.git_inspection import (
     MAX_GIT_OUTPUT_BYTES,
     inspect_git,
@@ -162,6 +164,213 @@ class GitInspectionTests(
             self.assertIn(
                 "+two",
                 result["diff"],
+            )
+
+    def test_sensitive_worktree_diff_is_rejected_before_content_diff(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            root = self.make_repo(
+                Path(td)
+            )
+
+            sensitive = (
+                root / ".env"
+            )
+
+            sensitive.write_text(
+                "TOKEN=initial\n",
+                encoding="utf-8",
+            )
+
+            self.git(
+                root,
+                "add",
+                "--",
+                ".env",
+            )
+
+            self.git(
+                root,
+                "-c",
+                "user.name=MAESTRO Test",
+                "-c",
+                (
+                    "user.email="
+                    "maestro@example.invalid"
+                ),
+                "commit",
+                "--no-gpg-sign",
+                "-q",
+                "-m",
+                "track sensitive fixture",
+            )
+
+            secret = (
+                "MAESTRO_SECRET_"
+                "WORKTREE_SENTINEL"
+            )
+
+            sensitive.write_text(
+                f"TOKEN={secret}\n",
+                encoding="utf-8",
+            )
+
+            calls = []
+
+            original_call = (
+                git_inspection_module._call
+            )
+
+            def recording_call(
+                *args,
+                **kwargs,
+            ):
+                calls.append(
+                    list(
+                        kwargs.get(
+                            "args"
+                        )
+                        or []
+                    )
+                )
+
+                return original_call(
+                    *args,
+                    **kwargs,
+                )
+
+            with mock.patch.object(
+                git_inspection_module,
+                "_call",
+                side_effect=recording_call,
+            ):
+                with self.assertRaises(
+                    PermissionError
+                ) as ctx:
+                    inspect_git(
+                        workspace_root=root,
+                        operation="git.diff",
+                        options={
+                            "scope": (
+                                "worktree"
+                            ),
+                        },
+                    )
+
+            self.assertNotIn(
+                secret,
+                str(ctx.exception),
+            )
+
+            diff_calls = [
+                argv
+                for argv in calls
+                if (
+                    argv
+                    and argv[0]
+                    == "diff"
+                )
+            ]
+
+            self.assertTrue(
+                diff_calls
+            )
+
+            self.assertTrue(
+                all(
+                    "--name-only"
+                    in argv
+                    for argv
+                    in diff_calls
+                )
+            )
+
+    def test_sensitive_staged_diff_is_rejected_without_secret_leak(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            root = self.make_repo(
+                Path(td)
+            )
+
+            sensitive = (
+                root
+                / "credentials.json"
+            )
+
+            sensitive.write_text(
+                '{"token":"initial"}\n',
+                encoding="utf-8",
+            )
+
+            self.git(
+                root,
+                "add",
+                "--",
+                "credentials.json",
+            )
+
+            self.git(
+                root,
+                "-c",
+                "user.name=MAESTRO Test",
+                "-c",
+                (
+                    "user.email="
+                    "maestro@example.invalid"
+                ),
+                "commit",
+                "--no-gpg-sign",
+                "-q",
+                "-m",
+                "track sensitive fixture",
+            )
+
+            secret = (
+                "MAESTRO_SECRET_"
+                "STAGED_SENTINEL"
+            )
+
+            sensitive.write_text(
+                (
+                    '{"token":"'
+                    + secret
+                    + '"}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            self.git(
+                root,
+                "add",
+                "--",
+                "credentials.json",
+            )
+
+            with self.assertRaises(
+                PermissionError
+            ) as ctx:
+                inspect_git(
+                    workspace_root=root,
+                    operation="git.diff",
+                    options={
+                        "scope": "staged",
+                    },
+                )
+
+            message = str(
+                ctx.exception
+            )
+
+            self.assertNotIn(
+                secret,
+                message,
+            )
+
+            self.assertNotIn(
+                "credentials.json",
+                message,
             )
 
     def test_external_diff_is_disabled(

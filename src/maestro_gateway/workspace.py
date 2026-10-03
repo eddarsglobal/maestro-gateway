@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .sensitive_policy import (
+    is_sensitive_path as _is_sensitive,
+)
 from .git_inspection import inspect_git as inspect_git_repository
 from .terminal import run_inspection_command
 
@@ -34,25 +37,6 @@ IGNORED_DIRS = {
     "build",
 }
 
-DENIED_NAMES = {
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".npmrc",
-    ".pypirc",
-    "id_rsa",
-    "id_ed25519",
-    "credentials",
-    "credentials.json",
-}
-
-DENIED_SUFFIXES = {
-    ".pem",
-    ".key",
-    ".p12",
-    ".pfx",
-}
-
 _WORKSPACE_ID = re.compile(r"^WS-[A-F0-9]{12}$")
 
 
@@ -62,18 +46,6 @@ def _utc_now() -> str:
 
 def _workspace_id() -> str:
     return "WS-" + uuid.uuid4().hex[:12].upper()
-
-
-def _is_sensitive(path: Path) -> bool:
-    name = path.name.casefold()
-
-    if name in DENIED_NAMES:
-        return True
-
-    if path.suffix.casefold() in DENIED_SUFFIXES:
-        return True
-
-    return False
 
 
 class WorkspaceRegistry:

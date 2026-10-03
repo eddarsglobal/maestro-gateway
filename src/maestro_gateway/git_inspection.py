@@ -11,6 +11,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .sensitive_policy import (
+    is_sensitive_path,
+)
+
 
 GIT_PROTOCOL = "P0.6E.1"
 GIT_MODE = "inspection_only"
@@ -763,6 +767,91 @@ def inspect_git(
                 raise ValueError(
                     "git.diff scope must "
                     "be worktree or staged"
+                )
+
+            # First discover only the changed
+            # repository-relative path names.
+            #
+            # No patch content is requested at
+            # this stage. Sensitive paths must
+            # be rejected before a content-
+            # producing `git diff` is allowed.
+            preflight_args = [
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+            ]
+
+            if scope == "staged":
+                preflight_args.append(
+                    "--cached"
+                )
+
+            preflight_args.append("--")
+
+            preflight = _call(
+                git_path=git_path,
+                cwd=root,
+                env=env,
+                args=preflight_args,
+                timeout_ms=(
+                    _TIMEOUT_MS[
+                        operation
+                    ]
+                ),
+            )
+
+            commands.append(
+                preflight
+            )
+
+            _require_success(
+                preflight,
+                operation=(
+                    "git.diff path preflight"
+                ),
+            )
+
+            if preflight.get(
+                "stdout_truncated"
+            ):
+                raise PermissionError(
+                    "git.diff content access "
+                    "denied because changed "
+                    "path discovery exceeded "
+                    "the safety limit"
+                )
+
+            changed_paths = [
+                value
+                for value
+                in str(
+                    preflight.get(
+                        "stdout"
+                    )
+                    or ""
+                ).split("\x00")
+                if value
+            ]
+
+            if any(
+                is_sensitive_path(
+                    Path(value)
+                )
+                for value
+                in changed_paths
+            ):
+                # Do not reveal the sensitive
+                # path in the exception and do
+                # not execute a content diff.
+                raise PermissionError(
+                    "git.diff content access "
+                    "to sensitive credential "
+                    "paths is denied"
                 )
 
             args = [
