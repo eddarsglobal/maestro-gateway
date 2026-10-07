@@ -6,6 +6,9 @@ from typing import Any
 
 from maestro import ProductionGenesisSystem
 from maestro.sovereign.discovery import SovereignDiscoveryBridge
+from maestro.research.web_fetch import (
+    build_governed_web_fetch_binding,
+)
 
 
 class MaestroCoreBridge:
@@ -63,6 +66,36 @@ class MaestroCoreBridge:
                 self._ollama_imported = True
 
             return len(system.sovereign_intelligence.registry.all())
+
+    def ensure_web_research(self):
+        """
+        Explicitly activate governed Web Research
+        on the existing production runtime.
+
+        This method is called only by an explicit
+        Research mission. Normal Gateway boot and
+        DIRECT missions remain Web-OFF.
+        """
+
+        with self._boot_lock:
+            runtime = self.system.os.runtime
+
+            if runtime.research is None:
+                runtime.activate_web_research(
+                    build_governed_web_fetch_binding()
+                )
+
+            if (
+                runtime.research is None
+                or runtime.research_evidence
+                is None
+            ):
+                raise RuntimeError(
+                    "Governed Web Research "
+                    "activation failed."
+                )
+
+            return runtime
 
     def health(self) -> dict[str, Any]:
         result = self.boot()

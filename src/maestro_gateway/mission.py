@@ -512,6 +512,488 @@ class GovernedDirectMissionRunner:
         self._workspaces = workspaces
         self._capabilities = capabilities
 
+    def run_research(
+        self,
+        *,
+        url: str | None,
+    ) -> dict[str, Any]:
+        """
+        Execute one explicit governed Web Research
+        mission through the existing MAESTRO
+        production runtime.
+
+        AY validates capture/provenance integrity
+        only. External semantic truth is never
+        asserted here.
+        """
+
+        if not isinstance(url, str):
+            raise ValueError(
+                "research_url must be a string."
+            )
+
+        if (
+            not url
+            or url != url.strip()
+        ):
+            raise ValueError(
+                "research_url must be a non-empty "
+                "URL without surrounding whitespace."
+            )
+
+        if len(url) > 4096:
+            raise ValueError(
+                "research_url is too long."
+            )
+
+        with self._core.mission_lock:
+            runtime = (
+                self._core.ensure_web_research()
+            )
+
+            kernel = runtime.kernel
+
+            mission = runtime.create_mission(
+                objective=(
+                    "Observe one explicit governed "
+                    "Web source."
+                ),
+                scope="EX -> RX -> AY -> TX",
+                requested_output=(
+                    "One durable unverified "
+                    "external research evidence "
+                    "record."
+                ),
+            )
+
+            mission.acceptance_criteria = [
+                (
+                    "AC-01: RX performs one "
+                    "governed Web fetch"
+                ),
+                (
+                    "AC-02: Research Evidence is "
+                    "durably persisted"
+                ),
+                (
+                    "AC-03: External semantic truth "
+                    "is not asserted"
+                ),
+                (
+                    "AC-04: AY validates capture "
+                    "integrity only"
+                ),
+                (
+                    "AC-05: TX commits the mission "
+                    "trace"
+                ),
+            ]
+
+            kernel.move(
+                mission,
+                MissionState.CONTEXT_LOADING,
+            )
+
+            kernel.move(
+                mission,
+                MissionState.ANALYSIS,
+            )
+
+            kernel.move(
+                mission,
+                MissionState.CONTRACT_PENDING,
+            )
+
+            mission.strike_team = [
+                CouncilId.RX,
+                CouncilId.AY,
+                CouncilId.TX,
+            ]
+
+            kernel.move(
+                mission,
+                MissionState.STRIKE_TEAM_CONVENED,
+            )
+
+            kernel.route(
+                RoutingRequest(
+                    task_id=mission.task_id,
+                    requested_by=CouncilId.EX,
+                    targets=[
+                        CouncilId.RX
+                    ],
+                    action="GOVERNED_WEB_FETCH",
+                    reason=(
+                        "Execute one explicit "
+                        "read-only governed Web "
+                        "observation."
+                    ),
+                )
+            )
+
+            kernel.move(
+                mission,
+                MissionState.DISPATCHED,
+            )
+
+            kernel.move(
+                mission,
+                MissionState.EXECUTING,
+            )
+
+            kernel.add_dag_node(
+                mission,
+                DagNode(
+                    node_id="rx-web-fetch",
+                    council=CouncilId.RX,
+                    action="GOVERNED_WEB_FETCH",
+                    criteria_ids=[
+                        "AC-01",
+                        "AC-02",
+                        "AC-03",
+                    ],
+                ),
+            )
+
+            kernel.start_dag_node(
+                mission,
+                "rx-web-fetch",
+            )
+
+            evidence = None
+            failure_evidence_id = None
+            error_type = None
+            passed = False
+
+            try:
+                evidence = (
+                    runtime.research_fetch(
+                        mission,
+                        url,
+                    )
+                )
+
+                verification = (
+                    evidence.payload[
+                        "verification"
+                    ]
+                )
+
+                if (
+                    verification.get("status")
+                    != "UNVERIFIED_EXTERNAL"
+                ):
+                    raise RuntimeError(
+                        "Research Evidence has an "
+                        "unexpected verification "
+                        "status."
+                    )
+
+                if (
+                    verification.get(
+                        "system_truth_asserted"
+                    )
+                    is not False
+                ):
+                    raise RuntimeError(
+                        "External semantic truth "
+                        "was improperly asserted."
+                    )
+
+                durable_rows = (
+                    runtime.research_evidence
+                    .for_task(
+                        mission.task_id
+                    )
+                )
+
+                if (
+                    len(durable_rows) != 1
+                    or durable_rows[0]
+                    .evidence_id
+                    != evidence.evidence_id
+                ):
+                    raise RuntimeError(
+                        "Durable Research Evidence "
+                        "verification failed."
+                    )
+
+                kernel.succeed_dag_node(
+                    mission,
+                    "rx-web-fetch",
+                    {
+                        "evidence_id": (
+                            evidence.evidence_id
+                        ),
+                        "source_ref": (
+                            evidence.source_ref
+                        ),
+                    },
+                )
+
+                passed = True
+
+            except Exception as exc:
+                error_type = (
+                    type(exc).__name__
+                )
+
+                kernel.fail_dag_node(
+                    mission,
+                    "rx-web-fetch",
+                    error_type,
+                )
+
+                failure_evidence_id = (
+                    kernel.add_evidence(
+                        Evidence(
+                            task_id=(
+                                mission.task_id
+                            ),
+                            council=CouncilId.RX,
+                            kind=(
+                                EvidenceKind
+                                .TEST_RESULT
+                            ),
+                            claim=(
+                                "Governed Web "
+                                "Research execution "
+                                "failed."
+                            ),
+                            payload={
+                                "error_type": (
+                                    error_type
+                                ),
+                                "url_sha256": (
+                                    hashlib.sha256(
+                                        url.encode(
+                                            "utf-8"
+                                        )
+                                    ).hexdigest()
+                                ),
+                                (
+                                    "semantic_truth_"
+                                    "verified"
+                                ): False,
+                            },
+                            source_ref=(
+                                "MAESTRO_GATEWAY_"
+                                "GW0_2"
+                            ),
+                        )
+                    )
+                )
+
+            audit_evidence_id = (
+                evidence.evidence_id
+                if evidence is not None
+                else failure_evidence_id
+            )
+
+            kernel.move(
+                mission,
+                MissionState.PAUSED_FOR_AUDIT,
+            )
+
+            kernel.move(
+                mission,
+                MissionState.AUDITING,
+            )
+
+            verdict_value = (
+                VerdictValue.JUSTE
+                if passed
+                else VerdictValue.FAUTE
+            )
+
+            kernel.submit_verdict(
+                mission,
+                Verdict(
+                    task_id=mission.task_id,
+                    council=CouncilId.RX,
+                    value=verdict_value,
+                    scope=VerdictScope.DOMAIN,
+                    evidence_ids=[
+                        str(audit_evidence_id)
+                    ],
+                    findings=[
+                        {
+                            "criterion": (
+                                "GW0.2_RX_FETCH"
+                            ),
+                            "result": (
+                                "PASS"
+                                if passed
+                                else "FAIL"
+                            ),
+                        }
+                    ],
+                ),
+            )
+
+            kernel.submit_verdict(
+                mission,
+                Verdict(
+                    task_id=mission.task_id,
+                    council=CouncilId.AY,
+                    value=verdict_value,
+                    scope=VerdictScope.SYSTEM,
+                    evidence_ids=[
+                        str(audit_evidence_id)
+                    ],
+                    findings=[
+                        {
+                            "criterion": (
+                                "GW0.2_RESEARCH_"
+                                "CAPTURE_INTEGRITY"
+                            ),
+                            "result": (
+                                "JUSTE"
+                                if passed
+                                else "FAUTE"
+                            ),
+                            "scope": (
+                                "PROVENANCE_AND_"
+                                "CAPTURE_INTEGRITY_"
+                                "ONLY"
+                            ),
+                            (
+                                "semantic_truth_"
+                                "verified"
+                            ): False,
+                        }
+                    ],
+                ),
+            )
+
+            if passed:
+                kernel.move(
+                    mission,
+                    MissionState.READY_FOR_RELEASE,
+                )
+
+                kernel.move(
+                    mission,
+                    MissionState.STATE_COMMIT_PENDING,
+                )
+
+                kernel.authorize_durable_commit(
+                    mission
+                )
+
+                kernel.commit_durable_state(
+                    mission
+                )
+
+                kernel.close(
+                    mission,
+                    durable_change_required=True,
+                )
+
+                runtime.persist(
+                    mission,
+                    (
+                        "GOVERNED_WEB_RESEARCH_"
+                        "MISSION_COMPLETE"
+                    ),
+                    "MAESTRO_GATEWAY",
+                    {
+                        "evidence_id": (
+                            evidence.evidence_id
+                        ),
+                        "source_ref": (
+                            evidence.source_ref
+                        ),
+                        (
+                            "semantic_truth_"
+                            "verified"
+                        ): False,
+                    },
+                )
+
+            else:
+                kernel.move(
+                    mission,
+                    MissionState.FAULT_RETURNED,
+                )
+
+                kernel.move(
+                    mission,
+                    MissionState.TASK_ABORTED,
+                )
+
+                runtime.persist(
+                    mission,
+                    (
+                        "GOVERNED_WEB_RESEARCH_"
+                        "MISSION_FAILED"
+                    ),
+                    "MAESTRO_GATEWAY",
+                    {
+                        "evidence_id": (
+                            failure_evidence_id
+                        ),
+                        "error_type": (
+                            error_type
+                        ),
+                        (
+                            "semantic_truth_"
+                            "verified"
+                        ): False,
+                    },
+                )
+
+            return {
+                "ok": passed,
+                "protocol": "GW0.2",
+                "mode": "M0_RESEARCH_FETCH",
+                "task_id": mission.task_id,
+                "state": mission.state.value,
+                "evidence_id": (
+                    evidence.evidence_id
+                    if evidence is not None
+                    else failure_evidence_id
+                ),
+                "source_ref": (
+                    evidence.source_ref
+                    if evidence is not None
+                    else None
+                ),
+                "verification_status": (
+                    evidence.payload[
+                        "verification"
+                    ]["status"]
+                    if evidence is not None
+                    else None
+                ),
+                "ay_verdict": (
+                    mission.system_verdict
+                    .value.value
+                    if mission.system_verdict
+                    else "NONE"
+                ),
+                "tx_authorized": bool(
+                    mission.tx_commit_authorized
+                ),
+                "tx_committed": bool(
+                    mission.tx_committed
+                ),
+                "semantic_truth_verified": False,
+                "error_type": error_type,
+                "stages": [
+                    "CONTRACT",
+                    "ROUTING_RX",
+                    "GOVERNED_WEB_FETCH",
+                    "DURABLE_EVIDENCE",
+                    "AY_CAPTURE_INTEGRITY",
+                    (
+                        "TX_COMMIT"
+                        if passed
+                        else "FAULT_RETURNED"
+                    ),
+                ],
+            }
+
     def run(
         self,
         *,
@@ -520,7 +1002,28 @@ class GovernedDirectMissionRunner:
         max_tokens: int = 512,
         conversation_id: str | None = None,
         workspace_id: str | None = None,
+        mode: str = "M0_DIRECT",
+        research_url: str | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(mode, str):
+            raise ValueError(
+                "mode must be a string."
+            )
+
+        normalized_mode = (
+            mode.strip().upper()
+        )
+
+        if normalized_mode == "M0_RESEARCH_FETCH":
+            return self.run_research(
+                url=research_url
+            )
+
+        if normalized_mode != "M0_DIRECT":
+            raise ValueError(
+                "Unsupported mission mode."
+            )
+
         prompt, max_tokens = validate_input(
             prompt,
             max_tokens,

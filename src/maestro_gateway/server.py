@@ -2114,6 +2114,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                 "workspace_id"
                             )
                         ),
+                        mode=payload.get(
+                            "mode",
+                            "M0_DIRECT",
+                        ),
+                        research_url=(
+                            payload.get(
+                                "research_url"
+                            )
+                        ),
                     )
                 )
             except ValueError as exc:
