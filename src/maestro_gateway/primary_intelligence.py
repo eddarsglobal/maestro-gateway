@@ -13,15 +13,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import RLock
+import hashlib
 import time
 from typing import Any
 
 from .adaptive_router import (
     RouteDecision, choose_adaptive_resource, classify_request,
-    _language_code, _eligible,
+    _language_code,
 )
 from .model_qualification import qualification
-from .autonomous_qualification import probe_evidence, model_version
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,9 @@ class PrimaryIntelligenceManager:
         self._quarantine: dict[str, float] = {}
         self._cooldown_seconds = 90.0
         self._inference_proven = False
+        # Prevent rapid primary oscillation on sparse or noisy real mission data.
+        self._last_measured_switch_at = float("-inf")
+        self._measured_switch_cooldown_seconds = 120.0
 
     @staticmethod
     def _eligible_local(registry: Any, task_class: str) -> dict[str, Any]:
@@ -128,21 +131,11 @@ class PrimaryIntelligenceManager:
                 reason = "primary_reused"
                 current_q = qualification(old, task, language)
                 if not current_q.qualified:
-                    # Only replace a provisional/nonperforming incumbent if
-                    # alternative task+language evidence is actually qualified.
+                    # Only actual authenticated mission outcomes can justify
+                    # promoting an operationally qualified alternative. V8
+                    # synthetic one-word probes never select the primary.
                     qualified = {rid: d for rid, d in available.items()
-                                 if qualification(rid, task, language).qualified}
-                    # Probe evidence alone never declares a model semantically
-                    # qualified. If the primary repeatedly failed both simple
-                    # operational probes, however, a two-probe-passing
-                    # alternative may be selected for a PROVISIONAL trial.
-                    if not qualified:
-                        failing = probe_evidence(old, model_version(available[old]), language)
-                        if failing['fail'] >= 3 and failing['pass'] == 0:
-                            qualified = {rid: d for rid, d in available.items()
-                                         if rid != old and
-                                         probe_evidence(rid, model_version(d), language)['pass'] >= 3
-                                         and probe_evidence(rid, model_version(d), language)['fail'] == 0}
+                                 if rid != old and qualification(rid, task, language).qualified}
                     if qualified:
                         best = choose_adaptive_resource(
                             _RestrictedRegistry(qualified.values()), prompt,
@@ -152,6 +145,18 @@ class PrimaryIntelligenceManager:
                             selected = best.resource_id
                             candidate = best
                             reason = "task_language_evidence"
+                elif now - self._last_measured_switch_at >= self._measured_switch_cooldown_seconds:
+                    # A successfully responding but very slow primary can be
+                    # replaced ONLY with sufficiently sampled, same-task and
+                    # same-language REAL mission measurements. V8 synthetic
+                    # probe pass counts, model size and provider names never
+                    # establish language competence or latency superiority.
+                    candidate_id = self._measured_alternative(
+                        available, old, task, language, current_q)
+                    if candidate_id is not None:
+                        selected = candidate_id
+                        reason = "measured_operational_improvement"
+                        self._last_measured_switch_at = now
 
             if selected != self._primary:
                 self._primary = selected
@@ -171,6 +176,44 @@ class PrimaryIntelligenceManager:
                 qualification_status="operationally_qualified" if q.qualified else "provisional",
                 language=language)
             return PrimarySelection(decision=decision, epoch=self._epoch, reason=reason)
+
+    @staticmethod
+    def _measured_alternative(available: dict[str, Any], incumbent: str,
+                              task: str, language: str, current: Any) -> str | None:
+        """Conservative, deterministic autonomous improvement from real missions.
+
+        Operational evidence is NOT semantic-language certification. Require
+        six attributable attempts for both competitors; 15 percentage points
+        better completion rate or 30%/1.5s better measured P95 with no
+        meaningful loss of completion reliability. A 120s switch cooldown
+        is enforced by select(). Neither synthetic microprobes nor resource
+        identity/size may drive this decision.
+        """
+        if not current.qualified or current.attempts < 6:
+            return None
+        current_rate = current.accepted / current.attempts
+        gains: list[tuple[float, bytes, str]] = []
+        for rid in available:
+            if rid == incumbent:
+                continue
+            other = qualification(rid, task, language)
+            if not other.qualified or other.attempts < 6:
+                continue
+            rate = other.accepted / other.attempts
+            reliability_gain = rate - current_rate
+            latency_gain_ms = (current.p95_ms - other.p95_ms
+                               if current.p95_ms is not None and other.p95_ms is not None else 0.0)
+            reliable_improvement = reliability_gain >= .15
+            latency_improvement = (rate >= current_rate - .05
+                                   and latency_gain_ms >= 1500
+                                   and other.p95_ms <= current.p95_ms * .70)
+            if reliable_improvement or latency_improvement:
+                # Reliability gains dominate same-task latency gains. SHA
+                # makes equal-score tie breaking independent of catalogue order.
+                gain = max(reliability_gain * 100.0,
+                           latency_gain_ms / 1000.0 if latency_improvement else 0.0)
+                gains.append((-gain, hashlib.blake2s(rid.encode(), digest_size=8).digest(), rid))
+        return min(gains)[2] if gains else None
 
     def failover(self, *, failed_id: str, replacement_id: str | None,
                  expected_epoch: int, registry: Any, reason: str) -> bool:
