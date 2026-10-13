@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_ALLOWED_ORIGINS = (
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://maestro.men",
-)
+DEFAULT_ALLOWED_ORIGINS: tuple[str, ...] = ()
 
 def _parse_origins(raw: str | None) -> tuple[str, ...]:
     if not raw:
@@ -18,8 +15,18 @@ def _parse_origins(raw: str | None) -> tuple[str, ...]:
         for item in raw.split(",")
         if item.strip()
     )
-    if "*" in values:
-        raise ValueError("Wildcard CORS origin '*' is forbidden.")
+    for origin in values:
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+            or not parsed.port
+            or parsed.path not in {"", "/"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query or parsed.fragment
+        ):
+            raise ValueError("Only explicit HTTP loopback browser origins are allowed.")
     return values
 
 @dataclass(frozen=True, slots=True)

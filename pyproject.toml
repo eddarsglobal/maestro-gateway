@@ -15,3 +15,6 @@ maestro-gateway = "maestro_gateway.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+maestro_gateway = ["webui/*.html", "webui/*.js", "webui/*.css"]

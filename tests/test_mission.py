@@ -10,7 +10,7 @@ class MissionInputTests(unittest.TestCase):
     def test_resource_id_normalization(self):
         self.assertEqual(
             _requested_resource_id("qwen3:8b"),
-            "ollama::qwen3:8b",
+            "qwen3:8b",
         )
         self.assertEqual(
             _requested_resource_id("ollama::gemma4:e4b"),

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import mimetypes
+import os
 import secrets
 import subprocess
 import sys
+import threading
+from importlib.resources import files
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -44,7 +48,14 @@ from .git_staging import (
     GitStageStateError,
 )
 from .mission import GovernedDirectMissionRunner
-from .ollama import discover_ollama
+from .mission_control import MissionControl, MissionConflictError, MissionCancelledError
+from .software_artifact_verifier import (
+    VerifiedSoftwareArtifacts, ArtifactVerificationError,
+)
+from .provider_inventory import discover_runtime_inventory
+from .autonomous_qualification import (AutonomousQualificationService,
+    execute_local_probe, model_version, update_model_versions,
+    probe_evidence, LANGUAGES)
 from .terminal import (
     TERMINAL_MODE,
     TERMINAL_PROTOCOL,
@@ -147,6 +158,9 @@ class GatewayHTTPServer(ThreadingHTTPServer):
 
         self.config = config
         self.core = core
+        # Passive detection at every launch, without eagerly booting the Core.
+        # Gateway health/invalid mission requests preserve zero-model safety.
+        core.prewarm_runtime_catalogue()
 
         user_root = (
             Path.home()
@@ -159,6 +173,11 @@ class GatewayHTTPServer(ThreadingHTTPServer):
                 user_root / "conversations"
             )
         )
+
+        # Read metrics before prompts; routing hot path uses only cached evidence.
+        from .adaptive_router import warm_route_history
+        threading.Thread(target=warm_route_history, args=(self.conversations.root,),
+                         daemon=True, name="MAESTRO-Route-Evidence").start()
 
         self.workspaces = WorkspaceRegistry(
             user_root
@@ -186,6 +205,42 @@ class GatewayHTTPServer(ThreadingHTTPServer):
             self.workspaces,
         )
 
+        self.artifact_verifier = VerifiedSoftwareArtifacts(
+            self.workspaces, self.changes, self.executions,
+        )
+
+        self.mission_control = MissionControl(user_root / "mission-controls")
+        # V8: automatic, idle-only and local-only qualification. An idle worker
+        # never boots Core, installs a model, or bypasses the authorized registry.
+        def approved_candidates():
+            if getattr(self.core, '_boot_result', None) is None:
+                return []
+            # Avoid the Core's ongoing guarded mutation and foreground traffic.
+            if self.mission_control._active:
+                return []
+            registry = self.core.system.sovereign_intelligence.registry
+            catalogue = list(getattr(self.core, '_catalog', ()))
+            fingerprints = {
+                f"{runtime['id']}::{name}": digest
+                for runtime in catalogue for name, digest in
+                (runtime.get('model_fingerprints') or {}).items()
+            }
+            update_model_versions(fingerprints)
+            return [(item, model_version(item, fingerprints)) for item in registry.all()]
+
+        def local_probe(descriptor, prompt, cancel, deadline):
+            catalogue = list(getattr(self.core, '_catalog', ()))
+            allowed = {runtime['id']: runtime['url'] for runtime in catalogue
+                       if runtime.get('selection_enabled') and runtime.get('status') == 'online'}
+            return execute_local_probe(descriptor, prompt, cancel, deadline, allowed)
+
+        self.autonomous_qualification = AutonomousQualificationService(
+            candidate_supplier=approved_candidates, runner=local_probe,
+            state_path=user_root / 'model-qualifications' / 'v8.json',
+            idle_seconds=float(os.getenv('MAESTRO_PROBE_IDLE_SECONDS', '90')),
+            probe_timeout=float(os.getenv('MAESTRO_PROBE_TIMEOUT_SECONDS', '25')),
+            enabled=os.getenv('MAESTRO_AUTO_QUALIFICATION', '1') != '0')
+        self.autonomous_qualification.start()
         self.capabilities = CapabilityRegistry()
 
         self.mission_runner = (
@@ -200,6 +255,12 @@ class GatewayHTTPServer(ThreadingHTTPServer):
         self.session_token = (
             secrets.token_urlsafe(32)
         )
+
+    def server_close(self) -> None:
+        # Stop background probes when Gateway exits; never leave them running.
+        self.autonomous_qualification.shutdown()
+        super().server_close()
+
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -231,14 +292,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _origin_allowed(self) -> bool:
         origin = self._origin()
-
         if origin is None:
             return True
+        expected_port = self.server.server_address[1]
+        same_origin = {
+            f"http://127.0.0.1:{expected_port}",
+            f"http://localhost:{expected_port}",
+            f"http://[::1]:{expected_port}",
+        }
+        return origin in same_origin or origin in self.server.config.allowed_origins
 
-        return (
-            origin
-            in self.server.config.allowed_origins
-        )
+    def _host_allowed(self) -> bool:
+        # DNS rebinding protection: loopback socket binding alone is insufficient.
+        supplied = self.headers.get("Host", "")
+        allowed_port = self.server.server_address[1]
+        return supplied in {
+            f"127.0.0.1:{allowed_port}",
+            f"localhost:{allowed_port}",
+            f"[::1]:{allowed_port}",
+        }
 
     def _common_headers(self) -> None:
         self.send_header(
@@ -257,14 +329,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "X-Frame-Options",
             "DENY",
         )
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("X-Permitted-Cross-Domain-Policies", "none")
 
         origin = self._origin()
 
-        if (
-            origin
-            and origin
-            in self.server.config.allowed_origins
-        ):
+        if origin and self._origin_allowed():
             self.send_header(
                 "Access-Control-Allow-Origin",
                 origin,
@@ -295,6 +366,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _reject_origin(self) -> bool:
+        if not self._host_allowed():
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "host_not_allowed", "message": "Invalid loopback Host header."},
+            )
+            return True
         if self._origin_allowed():
             return False
 
@@ -339,7 +416,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError(
                 "Request body exceeds "
-                "the 64 KiB limit"
+                "the 2 MiB limit"
             )
 
         raw = self.rfile.read(length)
@@ -441,6 +518,60 @@ class GatewayHandler(BaseHTTPRequestHandler):
         )
         self.end_headers()
 
+    def _serve_original_ui(self, path: str) -> bool:
+        """Serve the restored React production bundle, not the replacement UI.
+
+        Assets may only be read below the configured build directory.
+        No directory listing or SPA fallback outside /app/ is permitted.
+        """
+        configured = os.environ.get("MAESTRO_UI_DIST_DIR", "")
+        if not configured or path not in {"/app", "/app/"} and not path.startswith("/app/"):
+            return False
+
+        from urllib.parse import unquote
+        root = Path(configured).expanduser().resolve()
+        if not (root / "index.html").is_file():
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "original_ui_not_built", "message": "Run INSTALLER_MAC.command to compile the original MAESTRO UI."},
+            )
+            return True
+
+        raw_relative = "index.html" if path in {"/app", "/app/"} else unquote(path[len("/app/"):])
+        if (
+            not raw_relative or "\\" in raw_relative or "\x00" in raw_relative
+            or any(part in {".", "..", ""} for part in raw_relative.split("/"))
+        ):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "ui_asset_not_found"})
+            return True
+
+        requested = (root / raw_relative).resolve()
+        if not requested.is_relative_to(root) or not requested.is_file():
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "ui_asset_not_found"})
+            return True
+
+        content_type = mimetypes.guess_type(requested.name)[0] or "application/octet-stream"
+        if requested.suffix == ".js":
+            content_type = "text/javascript"
+        if content_type.startswith("text/") or content_type in {"application/javascript", "application/json"}:
+            content_type += "; charset=utf-8"
+        body = requested.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self._common_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; "
+            "script-src 'self'; style-src 'self'; "
+            "connect-src 'self'; img-src 'self' data:; "
+            "font-src 'self'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'; object-src 'none'",
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
     def do_GET(self) -> None:
         if self._reject_origin():
             return
@@ -450,6 +581,38 @@ class GatewayHandler(BaseHTTPRequestHandler):
         query = parse_qs(
             parsed.query
         )
+
+        if self._serve_original_ui(path):
+            return
+
+        if path in {"/app", "/app/", "/app/app.css", "/app/app.js"}:
+            resource = (
+                "index.html" if path in {"/app", "/app/"}
+                else path.rsplit("/", 1)[-1]
+            )
+            content_type = {
+                "index.html": "text/html; charset=utf-8",
+                "app.css": "text/css; charset=utf-8",
+                "app.js": "text/javascript; charset=utf-8",
+            }[resource]
+            body = files("maestro_gateway").joinpath(
+                "webui", resource
+            ).read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self._common_headers()
+            self.send_header("Content-Type", content_type)
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; "
+                "script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; img-src 'self' data:; "
+                "base-uri 'none'; form-action 'none'; "
+                "frame-ancestors 'none'; object-src 'none'",
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         if path == "/":
             self._send_json(
@@ -831,6 +994,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+        if path == "/mission/status":
+            if not self._require_session():
+                return
+            try:
+                record = self.server.mission_control.status(query.get("request_id", [None])[0])
+            except (ValueError, KeyError) as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error":"mission_status_not_found", "message":str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, record)
+            return
+
         if path == "/capabilities":
             if not self._require_session():
                 return
@@ -882,51 +1056,35 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/providers":
-            ollama = discover_ollama()
-
             self._send_json(
                 HTTPStatus.OK,
-                {
-                    "providers": [
-                        ollama,
-                        {
-                            "id": "lmstudio",
-                            "status": (
-                                "not_configured"
-                            ),
-                        },
-                        {
-                            "id": "llamacpp",
-                            "status": (
-                                "not_configured"
-                            ),
-                        },
-                        {
-                            "id": "custom",
-                            "status": (
-                                "not_configured"
-                            ),
-                        },
-                    ]
-                },
+                {"providers": self.server.core.runtime_inventory()},
             )
             return
 
         if path == "/models":
-            ollama = discover_ollama()
-
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "provider": "ollama",
-                    "status": (
-                        ollama["status"]
-                    ),
-                    "models": (
-                        ollama["models"]
-                    ),
-                },
-            )
+            inventory = self.server.core.runtime_inventory()
+            resources = [
+                f"{row['id']}::{model}"
+                for row in inventory if row.get("selection_enabled")
+                for model in row.get("models", [])
+            ]
+            self._send_json(HTTPStatus.OK, {
+                "provider": "multi", "status": "online" if resources else "offline",
+                "models": sorted(resources),
+                "sources": len([row for row in inventory if row.get("selection_enabled")]),
+                "primary": self.server.core.primary_intelligence.snapshot(),
+                "autonomous_qualification": self.server.autonomous_qualification.status(),
+                "qualification_evidence": [
+                    {"resource_id": d.resource_id,
+                     "languages": {lang: probe_evidence(d.resource_id,
+                        model_version(d), lang) for lang in LANGUAGES}}
+                    for d in self.server.core.system.sovereign_intelligence.registry.all()
+                    if getattr(d, 'local', None) is True and any(
+                        str(getattr(c, 'value', c)).upper() in ('DIRECT', 'GENERAL_REASONING')
+                        for c in (getattr(d, 'capabilities', ()) or ()))
+                ][:128],
+            })
             return
 
         if path == "/changes":
@@ -2083,6 +2241,37 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/software-project/verify-threejs":
+            if not self._require_session():
+                return
+            try:
+                payload = self._read_json()
+                result = self.server.artifact_verifier.verify_threejs(
+                    workspace_id=payload.get("workspace_id"),
+                    change_ids=payload.get("change_ids"),
+                    build_run_id=payload.get("build_run_id"),
+                )
+            except (ValueError, ArtifactVerificationError, KeyError) as exc:
+                self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {
+                    "ok": False, "error": "artifact_proof_incomplete",
+                    "message": str(exc), "semantic_truth_verified": False,
+                })
+                return
+            self._send_json(HTTPStatus.OK, result)
+            return
+
+        if path == "/mission/cancel":
+            if not self._require_session():
+                return
+            try:
+                payload = self._read_json()
+                record = self.server.mission_control.cancel(payload.get("request_id"))
+            except (ValueError, KeyError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_cancel_request", "message": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, record)
+            return
+
         if path == "/mission":
             if not self._require_session():
                 return
@@ -2090,10 +2279,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json()
 
-                result = (
-                    self.server
-                    .mission_runner
-                    .run(
+                request_id = payload.get("request_id")
+                result = None
+                cancellation = None
+                if request_id is not None:
+                    cancellation = self.server.mission_control.register(request_id)
+                foreground_engaged = False
+                try:
+                    if request_id is not None:
+                        self.server.mission_control.start(request_id)
+                    self.server.autonomous_qualification.user_activity(True)
+                    foreground_engaged = True
+                    result = (
+                        self.server
+                        .mission_runner
+                        .run(
                         prompt=payload.get(
                             "prompt"
                         ),
@@ -2123,8 +2323,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                 "research_url"
                             )
                         ),
+                        ui_language=payload.get("ui_language"),
+                        cancellation=cancellation,
                     )
-                )
+                    )
+                finally:
+                    if foreground_engaged:
+                        self.server.autonomous_qualification.user_activity(False)
+                    if request_id is not None and cancellation is not None:
+                        self.server.mission_control.finish(
+                            request_id, success=bool(result and result.get("ok")),
+                            cancelled=cancellation.is_set(),
+                        )
+            except MissionConflictError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error":"duplicate_mission_request", "message":str(exc)})
+                return
+            except MissionCancelledError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error":"mission_cancelled", "message":str(exc)})
+                return
             except ValueError as exc:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,

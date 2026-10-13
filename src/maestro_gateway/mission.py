@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import re
+import time
 from typing import Any
 
 from maestro.enums import (
@@ -15,21 +17,22 @@ from maestro.enums import (
 from maestro.models import Evidence, RoutingRequest, Verdict
 from maestro.orchestration.dag import DagNode
 from maestro.sovereign import IntelligenceCapability, IntelligenceRequest
+from maestro.providers.ollama.client import OllamaHTTPError
 
+from .ollama_gateway_client import MISSION_DEADLINE, MISSION_CANCEL
+from .mission_control import MissionCancelledError
+from .primary_intelligence import PrimarySelection
 from .capabilities import CapabilityRegistry
+from .adaptive_router import (choose_adaptive_resource, choose_quality_fallback,
+                              choose_timeout_fallback, _language_code, classify_request,
+                              response_language_hint)
+from .model_qualification import observe_attempt
 from .conversations import ConversationStore
 from .core import MaestroCoreBridge
-from .response_guard import evaluate_response
+from .response_guard import (evaluate_response, asks_about_capabilities,
+                             asks_about_previous_language)
 from .workspace import WorkspaceRegistry
 
-
-PREFERRED_GENERAL_RESOURCES = (
-    "ollama::qwen3:8b",
-    "ollama::gpt-oss:20b",
-    "ollama::gemma4:e4b",
-    "ollama::llama3.2:latest",
-    "ollama::qwen3:0.6b",
-)
 
 _TOOL_PATTERN = re.compile(
     r"^\s*<MAESTRO_TOOL>\s*(\{.*\})\s*</MAESTRO_TOOL>\s*$",
@@ -38,6 +41,45 @@ _TOOL_PATTERN = re.compile(
 
 MAX_TOOL_ROUNDS = 5
 MAX_QUALITY_RETRIES = 1
+
+
+# A general "who are you / what can you do" requires evidence, but not a
+# 20-capability API dump or a 512-token monologue. This is *only* a prompt and
+# bounded output optimization: a real authorized LLM must still answer.
+_FAST_INTRO_DETAIL = re.compile(
+    r"\b(?:d[eé]tail(?:le[rz]?)?|exhausti(?:f|ve)|complet(?:e|ement)?|"
+    r"pr[eé]cis[eé]ment|toutes?\s+(?:tes|vos)\s+capacit[eé]s|"
+    r"en\s+profondeur|in\s+detail|comprehensive|exhaustive|"
+    r"ausf[uü]hrlich|dettagliat[oa]|detaljn\w*)\b", re.I,
+)
+_FAST_INTRO_IDS = (
+    "conversation.context", "local_inference.execute", "workspace.open",
+    "filesystem.read", "filesystem.search", "filesystem.write",
+    "git.status", "git.commit", "computer_use",
+)
+
+
+def _fast_capability_intro(prompt: str, workspace_active: bool) -> bool:
+    """Broad, short, no-workspace self-introduction; no canned response."""
+    return (not workspace_active and asks_about_capabilities(prompt)
+            and len(prompt.strip()) <= 115
+            and not _FAST_INTRO_DETAIL.search(prompt))
+
+
+def _intro_capability_facts(snapshot: list[dict[str, Any]]) -> str:
+    """Live registry facts, never a static list of asserted permissions."""
+    by_id = {str(row.get("capability_id")): row for row in snapshot}
+    lines = ["VERIFIED MAESTRO CAPABILITIES (CURRENT SESSION):"]
+    for name in _FAST_INTRO_IDS:
+        item = by_id.get(name)
+        if item is None:
+            continue
+        # Keep exact operational status (including disabled and approval-only)
+        # from the current registry. Omit lengthy internal schema/protocol text.
+        description = str(item.get("description", "")).strip()
+        lines.append(f"- {name} [{item.get('status', 'unknown')}]: "
+                     + description[:150])
+    return "\n".join(lines)
 
 
 def _capability_names(resource: Any) -> set[str]:
@@ -64,10 +106,8 @@ def _requested_resource_id(
     if not value:
         return None
 
-    if value.startswith("ollama::"):
-        return value
-
-    return f"ollama::{value}"
+    # Never imply a provider for a bare model name.
+    return value
 
 
 def choose_direct_resource(
@@ -86,7 +126,12 @@ def choose_direct_resource(
         for resource in resources
     }
 
-    requested = _requested_resource_id(model)
+    requested = model.strip() if isinstance(model, str) and model.strip() else None
+    if requested is not None and requested not in by_id and "::" not in requested:
+        matches = [rid for rid in by_id if rid.split("::", 1)[-1] == requested]
+        if len(matches) > 1:
+            raise ValueError("Model name ambiguous across runtimes; select an exact resource ID")
+        requested = matches[0] if matches else requested
 
     if requested is not None:
         resource = by_id.get(requested)
@@ -131,12 +176,8 @@ def choose_direct_resource(
         ):
             eligible.append(resource_id)
 
-    for resource_id in PREFERRED_GENERAL_RESOURCES:
-        if resource_id in eligible:
-            return resource_id
-
     if eligible:
-        return sorted(eligible)[0]
+        return min(eligible, key=lambda rid: __import__("hashlib").sha256(rid.encode()).digest())  # vendor-neutral deterministic fallback
 
     raise RuntimeError(
         "No local DIRECT/GENERAL_REASONING "
@@ -1004,6 +1045,8 @@ class GovernedDirectMissionRunner:
         workspace_id: str | None = None,
         mode: str = "M0_DIRECT",
         research_url: str | None = None,
+        ui_language: str | None = None,
+        cancellation: Any = None,
     ) -> dict[str, Any]:
         if not isinstance(mode, str):
             raise ValueError(
@@ -1029,7 +1072,40 @@ class GovernedDirectMissionRunner:
             max_tokens,
         )
 
-        with self._core.mission_lock:
+        # The budget includes waiting for the shared governed mission lock.
+        # This is a bounded inference envelope, NOT a claim that other Core
+        # operations or an external Ollama process can always be killed.
+        # Simpler requests should fail promptly; meaningful explanations and
+        # workspace work deserve more time on resource-constrained local Macs.
+        # User-configured environment budget overrides these defaults.
+        budget_class = classify_request(
+            prompt, workspace_active=bool(workspace_id), ui_language=ui_language
+        )
+        default_budget = 90.0 if budget_class == "quick" else (
+            240.0 if workspace_id or budget_class == "code" else 210.0
+        )
+        raw_budget = os.getenv("MAESTRO_MISSION_BUDGET_SECONDS")
+        try:
+            mission_budget = float(raw_budget) if raw_budget is not None else default_budget
+        except (ValueError, TypeError):
+            mission_budget = default_budget
+        if not (5.0 <= mission_budget <= 300.0):
+            mission_budget = default_budget
+        mission_deadline = time.monotonic() + mission_budget
+
+        if cancellation is not None and cancellation.is_set():
+            raise MissionCancelledError("Mission cancelled before execution")
+        # Runtime discovery is outside Core mission_lock. Hot routing below is
+        # purely in-memory and performs no network operations.
+        # All conversational requests, including MAESTRO self-description,
+        # must use a real governed inference resource. No prewritten replies.
+        self._core.ensure_runtime_resources()
+        with self._core.conversation_lane(conversation_id, cancellation, mission_deadline), \
+                self._core.mission_lock:
+            if cancellation is not None and cancellation.is_set():
+                raise MissionCancelledError("Mission cancelled while waiting for Core")
+            if time.monotonic() >= mission_deadline:
+                raise TimeoutError("Mission expired waiting for governed Core")
             conversation = (
                 self._conversations.ensure(
                     conversation_id,
@@ -1071,7 +1147,13 @@ class GovernedDirectMissionRunner:
                         "Selected workspace no longer exists"
                     )
 
-            self._core.ensure_ollama_resources()
+            # A capability snapshot is grounding DATA, never a chat answer.
+            # If the registry has no inference resources, fail closed instead of
+            # fabricating a fluent response without a language model.
+            if not self._core.system.sovereign_intelligence.registry.all():
+                raise RuntimeError(
+                    "Aucun modèle d'inférence disponible. Vérifiez les moteurs dans SETTINGS."
+                )
             system = self._core.system
 
             runtime = system.os.runtime
@@ -1080,10 +1162,30 @@ class GovernedDirectMissionRunner:
                 system.sovereign_intelligence.registry
             )
 
-            resource_id = choose_direct_resource(
-                registry,
-                model=model,
-            )
+            routing_decision = None
+            primary_selection = None
+            if model is None or not str(model).strip():
+                primary_selection = self._core.primary_intelligence.select(
+                    registry, prompt,
+                    workspace_active=bool(active_workspace),
+                    max_tokens=max_tokens,
+                    ui_language=ui_language,
+                )
+                routing_decision = primary_selection.decision
+                resource_id = routing_decision.resource_id
+                max_tokens = routing_decision.prompt_budget
+            else:
+                resource_id = choose_direct_resource(registry, model=model)
+
+            route_task = (routing_decision.task_class if routing_decision else
+                          classify_request(prompt, workspace_active=bool(active_workspace), ui_language=ui_language))
+            route_language = routing_decision.language if routing_decision else _language_code(prompt, ui_language)
+
+            fast_intro = _fast_capability_intro(prompt, bool(active_workspace))
+            if fast_intro:
+                # Self-introduction is a short conversational explanation, not
+                # an exhaustive inventory. Never change the normal/code budget.
+                max_tokens = min(max_tokens, 192)
 
             mission = runtime.create_mission(
                 objective=(
@@ -1262,18 +1364,116 @@ class GovernedDirectMissionRunner:
                 else ""
             )
 
-            base_instruction = (
-                capability_text
-                + "\n\n"
-                + language_rule
-                + "\n"
-                + behavior_rule
-                + tool_rule
-                + context_block
-                + "\n\nCURRENT USER REQUEST:\n"
-                + prompt
-            )
+            capability_snapshot = None
+            if asks_about_capabilities(prompt):
+                # Dynamic factual grounding, no new permission is granted.
+                observed = self._capabilities.snapshot(
+                    workspace_active=bool(active_workspace),
+                    workspace_kind=(str(active_workspace["kind"])
+                                    if active_workspace else None),
+                )
+                capability_snapshot = observed
+                capability_text = (_intro_capability_facts(observed) if fast_intro
+                                   else "\n".join(
+                                       ["VERIFIED MAESTRO CAPABILITIES (CURRENT SESSION):"]
+                                       + [f"- {item['capability_id']} "
+                                          f"[{item['status']}]: {item['description']}"
+                                          for item in observed]
+                                   ))
+                behavior_rule += (
+                    "\nThe user is asking for your actual capabilities. "
+                    "Give several CONCRETE examples from the verified "
+                    "capability snapshot. Explain when workspace "
+                    "authorization or separate approval is required. "
+                    "Do not claim unavailable computer-use or unrestricted "
+                    "web access. Do not answer only with your identity or "
+                    "'what do you need?'. "
+                    "Clearly distinguish reading inside an authorized "
+                    "workspace from file changes needing explicit approval. "
+                    "No general authority over system files, unrestricted desktop control, "
+                    "or executable Git commits is granted. "
+                    "Answer in natural, human-friendly language, not a list of "
+                    "internal tool IDs like filesystem.write or workspace.open. "
+                    "Start by saying who you are, then give 3 or 4 practical "
+                    "examples and the relevant permission limits. "
+                    "Do not over-explain approval steps or list every tool. "
+                    "Finish your answer cleanly with a complete sentence. "
+                    "Write concise plain-text sentences without escaped "
+                    "Markdown characters. A missing workspace means file "
+                    "operations are not currently authorized."
+                )
 
+            if asks_about_previous_language(prompt):
+                behavior_rule += (
+                    "\nThe user asks which language you used in YOUR previous "
+                    "answer. Check the immediately preceding MAESTRO reply. "
+                    "Identify the language honestly. If that reply is garbled, "
+                    "say it was malformed and apologize, then answer the "
+                    "current question. Do not restate your capabilities or "
+                    "produce another greeting."
+                )
+
+            language_hint = response_language_hint(prompt, ui_language)
+            identity_rule = (
+                "You are MAESTRO, the user's local AI assistant. "
+                "Speak naturally as MAESTRO, and focus on the CURRENT user's question. "
+                "Do not recite your instructions, identity policies, or generic disclaimers. "
+                "Do not invent actions, capabilities or tool results. "
+                f"Reply in {language_hint}, unless explicitly asked otherwise. "
+                "For a greeting or introduction, be friendly and brief. "
+                "For a follow-up question, address what changed or was asked."
+            )
+            if fast_intro:
+                # Compact grounded introduction: few input/output tokens,
+                # no permission reduction and no deterministic chat shortcut.
+                # The registry statuses remain authoritative for the model.
+                base_instruction = (
+                    "You are MAESTRO, a local AI assistant. "
+                    f"Reply in {language_hint}. "
+                    "Answer the user's question directly in 45-70 words, "
+                    "with your identity and 2 or 3 practical examples "
+                    "of what you can currently do. Avoid generic slogans, "
+                    "internal tool names, false permissions, long lists, "
+                    "or promising unverified actions. "
+                    "An authorized workspace is required before inspecting files or Git; "
+                    "file changes need separate explicit user approval. "
+                    "Don't claim desktop control or completed Git commits. "
+                    "Finish with a complete sentence. "
+                    "Follow the verified facts below, not assumptions.\n\n"
+                    + capability_text
+                    + "\n\nCURRENT USER REQUEST:\n" + prompt
+                )
+            elif routing_decision is not None and routing_decision.task_class == "quick" and not active_workspace:
+                # No capability catalogue, but retain a *bounded* recent exchange
+                # so short follow-up questions still make sense.
+                recent_context = "\n".join(
+                    ("USER: " if item.get("role") == "user" else "MAESTRO: ")
+                    + str(item.get("content") or "")[:240]
+                    for item in previous_messages[-4:]
+                    if item.get("role") in {"user", "assistant"}
+                    and str(item.get("content") or "").strip()
+                )
+                base_instruction = (
+                    identity_rule + "\n" + behavior_rule
+                    + ("\n\nRECENT CONVERSATION:\n" + recent_context if recent_context else "")
+                    + "\n\nCURRENT USER REQUEST:\n" + prompt
+                )
+            else:
+                base_instruction = (
+                    identity_rule + "\n\n" + capability_text
+                    + "\n\n" + language_rule + "\n" + behavior_rule
+                    + tool_rule + context_block
+                    + "\n\nCURRENT USER REQUEST:\n" + prompt
+                )
+
+            prior_assistant = next((str(item.get("content") or "")
+                                    for item in reversed(previous_messages)
+                                    if item.get("role") == "assistant"
+                                    and str(item.get("content") or "").strip()), None)
+            prior_user = next((str(item.get("content") or "")
+                               for item in reversed(previous_messages)
+                               if item.get("role") == "user"
+                               and str(item.get("content") or "").strip()), None)
             transcript = base_instruction
             response = None
             output = ""
@@ -1284,17 +1484,28 @@ class GovernedDirectMissionRunner:
             quality_retries = 0
             resource_calls = 0
             quality_reason = "not_evaluated"
+            quality_escalations = 0
+            timeout_recoveries = 0
+            model_sequence: list[str] = []
+            cumulative_total_ms = 0.0
+            cumulative_load_ms = 0.0
+            model_attempt_metrics: list[dict[str, Any]] = []
+            inference_start = time.monotonic()
+            mission_deadline_token = MISSION_DEADLINE.set(mission_deadline)
+            mission_cancel_token = MISSION_CANCEL.set(cancellation)
 
             try:
-                adapter = registry.adapter(
-                    resource_id
-                )
+                adapter = registry.adapter(resource_id)
 
                 for _round in range(
                     MAX_TOOL_ROUNDS
                     + MAX_QUALITY_RETRIES
                     + 1
                 ):
+                    if cancellation is not None and cancellation.is_set():
+                        raise MissionCancelledError("Mission cancelled before inference")
+                    if time.monotonic() >= mission_deadline:
+                        raise TimeoutError("Governed mission wall-clock budget exhausted")
                     request = IntelligenceRequest(
                         task_id=mission.task_id,
                         capability=(
@@ -1329,10 +1540,79 @@ class GovernedDirectMissionRunner:
                         },
                     )
 
-                    response = adapter.execute(
-                        request
-                    )
+                    model_sequence.append(resource_id)
+                    model_call_start = time.monotonic()
+                    try:
+                        # Core shared state is NOT accessed during remote inference.
+                        # Other conversations can now enter their own guarded
+                        # transitions while this Ollama request is in flight.
+                        if getattr(adapter, "io_only", False) or resource_id.startswith("ollama::"):
+                            with self._core.unlocked_during_model_io():
+                                response = adapter.execute(request)
+                        else:
+                            # Unknown future adapters may mutate governed Core
+                            # state. Fail conservatively: serialize them until
+                            # their I/O-only contract is separately audited.
+                            response = adapter.execute(request)
+                    except (TimeoutError, OllamaHTTPError) as exc:
+                        resource_calls += 1
+                        elapsed_ms = round((time.monotonic() - model_call_start) * 1000, 3)
+                        model_attempt_metrics.append({
+                            "resource_id": resource_id,
+                            "wall_ms": elapsed_ms,
+                            "outcome": "timeout" if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower() else "transport_failure",
+                            "error_type": type(exc).__name__,
+                        })
+                        timed_out = (isinstance(exc, TimeoutError)
+                                     or "timed out" in str(exc).lower()
+                                     or "deadline" in str(exc).lower())
+                        # Never retry a manually selected model or an
+                        # authorized Workspace mission. For conversational
+                        # AUTO, at most ONE retry is permitted in total.
+                        alternative = None
+                        if (timed_out and routing_decision is not None
+                                and routing_decision.task_class in {"quick", "normal"}
+                                and not active_workspace
+                                and timeout_recoveries == 0
+                                and quality_retries == 0):
+                            alternative = choose_timeout_fallback(
+                                registry, resource_id, self._conversations.root,
+                                task_class=routing_decision.task_class,
+                                language=route_language,
+                                remaining_seconds=max(0., mission_deadline-time.monotonic()),
+                            )
+                        if primary_selection is not None:
+                            promoted = self._core.primary_intelligence.failover(
+                                failed_id=resource_id, replacement_id=alternative,
+                                expected_epoch=primary_selection.epoch,
+                                registry=registry,
+                                reason="timeout" if timed_out else "transport_failure",
+                            )
+                            if promoted and alternative is not None:
+                                # This same mission may timeout again after its
+                                # single authorized fallback. Track the new
+                                # epoch so the second failure can invalidate it.
+                                primary_selection = PrimarySelection(
+                                    primary_selection.decision,
+                                    primary_selection.epoch + 1,
+                                    "promoted_after_timeout",
+                                )
+                        if alternative is not None:
+                            timeout_recoveries += 1
+                            resource_id = alternative
+                            adapter = registry.adapter(resource_id)
+                            continue
+                        if timed_out:
+                            raise RuntimeError(
+                                "Le moteur d’inférence a dépassé le délai autorisé. "
+                                "Aucun autre modèle qualifié et compatible avec "
+                                "la langue et le délai restant n'est disponible. "
+                                "Consultez les modèles dans SETTINGS."
+                            ) from exc
+                        raise
                     resource_calls += 1
+                    if cancellation is not None and cancellation.is_set():
+                        raise MissionCancelledError("Mission cancelled after inference")
 
                     candidate = str(
                         response.output or ""
@@ -1355,9 +1635,49 @@ class GovernedDirectMissionRunner:
                             "generated_tokens",
                             "tokens_per_second",
                             "think_policy",
+                            "done_reason",
+                            "finish_reason",
                         )
                         if key in raw_metrics
                     }
+
+                    # Ollama exposes load, decoded tokens and decoding speed.
+                    # This yields an approximate prompt/evaluation breakdown
+                    # without touching the sovereign Core provider adapter.
+                    decoded = metrics.get("generated_tokens")
+                    speed = metrics.get("tokens_per_second")
+                    total = metrics.get("total_ms")
+                    loaded = metrics.get("load_ms")
+                    decode_ms = (round(1000 * decoded / speed, 3)
+                                 if isinstance(decoded, (int, float))
+                                 and isinstance(speed, (int, float))
+                                 and not isinstance(decoded, bool)
+                                 and not isinstance(speed, bool) and speed > 0 else None)
+                    setup_ms = (round(max(0.0, total - loaded - decode_ms), 3)
+                                if decode_ms is not None
+                                and isinstance(total, (int, float))
+                                and isinstance(loaded, (int, float)) else None)
+                    model_attempt_metrics.append({
+                        "resource_id": resource_id,
+                        "total_ms": total,
+                        "wall_ms": round((time.monotonic() - model_call_start) * 1000, 3),
+                        "load_ms": loaded,
+                        "prompt_and_overhead_ms_estimate": setup_ms,
+                        "decode_ms_estimate": decode_ms,
+                        "prompt_tokens": metrics.get("prompt_tokens"),
+                        "generated_tokens": decoded,
+                        "tokens_per_second": speed,
+                        "done_reason": metrics.get("done_reason") or metrics.get("finish_reason"),
+                        "outcome": "pending_quality_review",
+                    })
+                    for metric_key, accumulator in (("total_ms", "total"),
+                                                    ("load_ms", "load")):
+                        value = metrics.get(metric_key)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            if accumulator == "total":
+                                cumulative_total_ms += float(value)
+                            else:
+                                cumulative_load_ms += float(value)
 
                     if not response.success:
                         raise RuntimeError(
@@ -1513,25 +1833,63 @@ class GovernedDirectMissionRunner:
                     quality = evaluate_response(
                         prompt,
                         candidate,
+                        prior_output=prior_assistant,
+                        prior_user_prompt=prior_user,
+                        capability_snapshot=capability_snapshot,
+                        completion_reason=(
+                            metrics.get("done_reason") or metrics.get("finish_reason")
+                        ),
                     )
                     quality_reason = quality.reason
+                    # A successful HTTP request is not yet a successful answer.
+                    # Record quality only AFTER the response guard verdict.
+                    model_attempt_metrics[-1]["outcome"] = (
+                        "quality_accepted" if quality.accepted else "quality_rejected"
+                    )
 
                     if (
                         not quality.accepted
                         and quality_retries
                         < MAX_QUALITY_RETRIES
+                        and timeout_recoveries == 0
                     ):
                         quality_retries += 1
-                        transcript += (
-                            "\n\nMAESTRO QUALITY GUARD:\n"
-                            "The previous candidate was "
-                            "rejected because it merely "
-                            "repeated or closely paraphrased "
-                            "the user's request. Answer the "
-                            "question substantively instead. "
-                            "Do not repeat the request.\n"
-                            "REJECTED CANDIDATE:\n"
-                            + candidate
+                        # Only AUTO may escalate, and only to a previously
+                        # registered resource with existing DIRECT capability.
+                        alternative = None
+                        if routing_decision is not None and not active_workspace:
+                            alternative = choose_quality_fallback(
+                                registry, resource_id, self._conversations.root,
+                                task_class=routing_decision.task_class,
+                                language=route_language,
+                                remaining_seconds=max(0., mission_deadline-time.monotonic()),
+                            )
+                        if alternative is not None:
+                            if primary_selection is not None:
+                                promoted = self._core.primary_intelligence.failover(
+                                    failed_id=resource_id, replacement_id=alternative,
+                                    expected_epoch=primary_selection.epoch,
+                                    registry=registry, reason="quality_rejected",
+                                )
+                                if promoted:
+                                    primary_selection = PrimarySelection(
+                                        primary_selection.decision,
+                                        primary_selection.epoch + 1,
+                                        "promoted_after_quality_rejection",
+                                    )
+                            adapter = registry.adapter(alternative)
+                            resource_id = alternative
+                            quality_escalations += 1
+                        # Never feed a bad draft back into the model: it can
+                        # otherwise reinforce exactly the repeated disclaimer.
+                        transcript = (
+                            base_instruction
+                            + "\n\nRESPONSE QUALITY RETRY: The last output "
+                            "failed to address the CURRENT user question "
+                            "(reason: " + quality.reason + "). "
+                            "Answer the present question concretely, using "
+                            "recent conversation only when relevant. "
+                            "Do not repeat identity policies or the previous answer."
                         )
                         continue
 
@@ -1550,6 +1908,8 @@ class GovernedDirectMissionRunner:
                         "produced"
                     )
 
+                if cancellation is not None and cancellation.is_set():
+                    raise MissionCancelledError("Mission cancelled before verification")
                 passed = True
 
             except Exception as exc:
@@ -1557,9 +1917,20 @@ class GovernedDirectMissionRunner:
                 error = (
                     f"{type(exc).__name__}: {exc}"
                 )
+            finally:
+                MISSION_CANCEL.reset(mission_cancel_token)
+                MISSION_DEADLINE.reset(mission_deadline_token)
 
             metrics = {
                 **metrics,
+                **({"total_ms": cumulative_total_ms,
+                    "load_ms": cumulative_load_ms} if resource_calls else {}),
+                "model_sequence": model_sequence,
+                "mission_budget_ms": round(mission_budget * 1000, 3),
+                "model_attempt_metrics": model_attempt_metrics,
+                "wall_ms": round((time.monotonic() - inference_start) * 1000, 3),
+                "quality_escalations": quality_escalations,
+                "timeout_recoveries": timeout_recoveries,
                 "resource_calls": resource_calls,
                 "tool_calls": len(tool_calls),
                 "tool_failures": tool_failures,
@@ -1567,8 +1938,23 @@ class GovernedDirectMissionRunner:
                     quality_retries
                 ),
                 "quality_reason": quality_reason,
+                "routing_policy": routing_decision.policy if routing_decision else "manual",
+                "primary_selection_reason": primary_selection.reason if primary_selection else "manual_override",
+                "primary_selection_epoch": primary_selection.epoch if primary_selection else None,
+                "fast_capabilities_intro": fast_intro,
+                "response_token_budget": max_tokens,
+                "routing_class": routing_decision.task_class if routing_decision else "manual",
+                "qualification_task": route_task,
+                "routing_language": route_language,
+                "routing_qualification_status": routing_decision.qualification_status if routing_decision else "manually_selected",
+                "response_origin": "local_model",
+                "routing_evidence_count": routing_decision.evidence_count if routing_decision else 0,
             }
 
+            if cancellation is not None and cancellation.is_set():
+                passed = False
+                output = ""
+                error = "MissionCancelledError: Mission cancelled before durable commit"
             if passed:
                 kernel.succeed_dag_node(
                     mission,
@@ -1638,13 +2024,8 @@ class GovernedDirectMissionRunner:
                         "quality_reason": (
                             quality_reason
                         ),
-                        "resource_execution_pass": bool(
-                            response is not None
-                            and getattr(
-                                response,
-                                "success",
-                                False,
-                            )
+                        "resource_execution_pass": (
+                            response is not None and getattr(response, "success", False)
                         ),
                         "non_empty_output": bool(
                             output
@@ -1908,13 +2289,26 @@ class GovernedDirectMissionRunner:
                         conversation["id"],
                         role="assistant",
                         content=output,
-                        metadata={
-                            "mission": result
-                        },
+                        metadata={"mission": result},
                     )
                 )
-                result["conversation_title"] = (
-                    conversation["title"]
+                result["conversation_title"] = conversation["title"]
+            elif resource_calls:
+                # Preserve bounded model attempt evidence even if both
+                # calls timed out. A hidden system event is not a user-facing
+                # assistant answer and is excluded from conversational prompts.
+                self._conversations.append_message(
+                    conversation["id"],
+                    role="system", content="MAESTRO_MISSION_FAILED",
+                    metadata={"mission": result},
                 )
 
+            # Record trusted Gateway observations after the governed verdict.
+            # No chat content or user prompt is sent to the qualification store.
+            for attempt in model_attempt_metrics:
+                observe_attempt(attempt.get("resource_id"), route_task,
+                                route_language, attempt.get("outcome"),
+                                attempt.get("wall_ms"))
+            if result.get("ok") and primary_selection is not None:
+                self._core.primary_intelligence.note_success(resource_id, expected_epoch=primary_selection.epoch)
             return result

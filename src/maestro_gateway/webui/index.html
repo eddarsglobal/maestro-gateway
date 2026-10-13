@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MAESTRO — Autonomous Intelligence</title>
+  <link rel="stylesheet" href="/app/app.css">
+  <script src="/app/app.js" defer></script>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <header class="brand"><div class="mark">M<span>·</span></div><div><strong>MAESTRO</strong><small>SOVEREIGN INTELLIGENCE</small></div></header>
+    <button type="button" id="newChat" class="new-chat"><span>＋</span> Nouvelle conversation</button>
+    <div class="aside-label">ESPACE DE TRAVAIL</div>
+    <button type="button" id="chooseWorkspace" class="workspace"><span>◫</span><span id="workspaceName">Sélectionner un dossier</span><span class="arrow">↗</span></button>
+    <div class="aside-label conversations-head"><span>CONVERSATIONS</span><button id="reloadChats" title="Actualiser les conversations">↻</button></div>
+    <nav class="conversations" id="conversations" aria-label="Conversations"></nav>
+    <div class="sidebar-bottom"><button type="button" id="openSettings" class="settings-trigger" aria-haspopup="dialog" aria-controls="settingsDialog">⚙ <span>SETTINGS</span></button><div class="status-line"><span id="coreDot" class="dot"></span><span id="coreState">Vérification du Core…</span></div><div class="status-line"><span id="modelDot" class="dot muted"></span><span id="modelState">IA locale non vérifiée</span></div><p class="sidebar-foot">EXÉCUTION GOUVERNÉE · LOCAL-FIRST</p></div>
+  </aside>
+  <main class="main">
+    <div class="topbar"><div class="top-left"><span class="breadcrumb">WORKSPACE</span><span class="divider-small">/</span><strong id="currentTitle">Nouvelle conversation</strong></div><div class="top-right"><span class="chip">● LOCAL GATEWAY</span><button class="outline top-settings" id="openSettingsTop" aria-haspopup="dialog" aria-controls="settingsDialog" title="Paramètres de MAESTRO">⚙ Settings</button><button class="outline" id="openWorkspace">Ouvrir un dossier</button></div></div>
+    <section id="welcome" class="welcome"><div class="hero-eyebrow"><span class="pulse"></span> MAESTRO CORE + COUNCILS</div><div class="hero-logo">M<span>·</span></div><h1>Que pouvons-nous <em>accomplir</em> ?</h1><p>Une intelligence orchestrée, avec contrôle explicite sur les fichiers, les outils et les ressources. Vos conversations restent sur cette machine.</p><div class="suggestions"><button data-prompt="Explique-moi l'état du système et ce que tu peux faire avec ce Workspace.">◈ <span>Explorer mes capacités</span><span class="end">↗</span></button><button data-prompt="Examine la structure de ce projet et propose des améliorations sans rien modifier.">⌘ <span>Analyser ce projet</span><span class="end">↗</span></button><button data-prompt="Prépare un plan de développement concret, avec étapes vérifiables et risques.">▦ <span>Créer un plan de travail</span><span class="end">↗</span></button></div></section>
+    <section id="chat" class="chat" aria-live="polite" aria-label="Historique de discussion" hidden></section>
+    <section class="composer-wrap"><form id="composer" class="composer"><label for="prompt" class="visually-hidden">Votre message</label><textarea id="prompt" rows="2" placeholder="Demander à MAESTRO…" maxlength="32000" required></textarea><div class="composer-controls"><div class="control-group"><span class="mini-workspace" id="composerWorkspace">◎ Aucun Workspace</span><label class="model-label" for="model">Modèle</label><select id="model" aria-label="Modèle IA"><option value="">Automatique</option></select></div><div class="control-group"><button type="submit" id="send" class="send" title="Envoyer">↑</button></div></div></form><p class="hint">MAESTRO peut se tromper. Les opérations sur les fichiers nécessitent une autorisation gouvernée. <span id="feedback"></span></p></section>
+  </main>
+  <aside class="inspector"><div class="inspector-head"><span>CONTRÔLE &amp; TRAÇABILITÉ</span><span class="inspect-icon">◈</span></div><div class="inspector-content"><div class="panel"><div class="panel-header">État du système <button id="refreshHealth" title="Actualiser">↻</button></div><div class="kv"><span>Core</span><strong id="healthValue">…</strong></div><div class="kv"><span>Gateway</span><strong id="gatewayValue">Connecté</strong></div><div class="kv"><span>IA</span><strong id="providerValue">Vérification…</strong></div></div><div class="panel"><div class="panel-header">Changements proposés <button id="refreshChanges" title="Actualiser">↻</button></div><div id="changeList" class="changes"><p class="muted-text">Aucune proposition chargée.</p></div></div><div class="panel"><div class="panel-header">Gouvernance</div><p class="policy">Les modifications exigent trois étapes distinctes : <strong>proposer → approuver → appliquer.</strong></p><p class="policy">Les modèles sont des ressources, pas une autorité.</p></div><div class="inspector-note">Les propositions de modification sont vérifiées par le Gateway. Aucun fichier n'est modifié par une simple réponse textuelle.</div></div></aside>
+</div>
+<dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsTitle">
+  <form id="settingsForm" class="settings-form">
+    <div class="settings-heading"><div><span class="hero-eyebrow">MAESTRO · LOCAL CONFIGURATION</span><h2 id="settingsTitle">⚙ Settings</h2><p>Préférences de conversation enregistrées uniquement dans ce navigateur.</p></div><button type="button" id="closeSettings" class="settings-close" aria-label="Fermer les paramètres">×</button></div>
+    <div class="settings-section"><h3>Intelligence locale</h3><div class="setting-provider"><span class="dot" id="settingsProviderDot"></span><span><strong>Ollama</strong><small id="settingsProviderStatus">Vérification…</small></span><button type="button" id="checkModels" class="outline">Actualiser</button></div><p class="settings-hint">Ollama : <code>http://127.0.0.1:11434</code>. Les autres fournisseurs ne sont pas encore connectés à ce Gateway.</p></div>
+    <div class="settings-section"><h3>Conversation</h3><label for="settingsModel">Modèle par défaut</label><select id="settingsModel" name="settingsModel"><option value="">Automatique</option></select><label for="settingsTokens">Limite de génération</label><select id="settingsTokens" name="settingsTokens"><option value="256">256 tokens</option><option value="512">512 tokens</option><option value="1024">1 024 tokens</option><option value="2048">2 048 tokens</option></select></div>
+    <div class="settings-section"><h3>Apparence</h3><label for="settingsTheme">Thème</label><select id="settingsTheme" name="settingsTheme"><option value="dark">Sombre</option><option value="light">Clair</option><option value="system">Système</option></select></div>
+    <div class="settings-footer"><span id="settingsFeedback" role="status"></span><button type="button" id="cancelSettings" class="outline">Annuler</button><button type="submit" class="settings-save">Enregistrer</button></div>
+  </form>
+</dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
