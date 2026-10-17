@@ -799,8 +799,27 @@ def _run_bounded_process(
     cwd: Path,
     env: dict[str, str],
     timeout_ms: int,
+    cancellation: threading.Event | None = None,
 ) -> dict[str, Any]:
+    """Bounded approved process; cooperative signal terminates its process group.
+
+    Cancellation is per invocation, never global. It is deliberately optional
+    so existing authorized execution paths retain their original behavior.
+    """
     started = time.perf_counter()
+    if cancellation is not None and cancellation.is_set():
+        empty = _BoundedStreamCollector(MAX_EXECUTION_OUTPUT_BYTES).result()
+        return {
+            "exit_code": None, "timed_out": False, "cancelled": True,
+            "process_group_terminated": False,
+            "duration_ms": 0,
+            "stdout": empty["text"], "stderr": empty["text"],
+            "stdout_sha256": empty["sha256"],
+            "stderr_sha256": empty["sha256"],
+            "stdout_bytes": 0, "stderr_bytes": 0,
+            "stdout_truncated": False, "stderr_truncated": False,
+            "stdout_reader_error": None, "stderr_reader_error": None,
+        }
 
     process = subprocess.Popen(
         argv,
@@ -854,24 +873,32 @@ def _run_bounded_process(
     stderr_thread.start()
 
     timed_out = False
+    cancelled = False
     group_terminated = False
+    deadline = time.monotonic() + timeout_ms / 1000.0
 
-    try:
-        process.wait(
-            timeout=(
-                timeout_ms
-                / 1000.0
-            )
-        )
+    # subprocess.wait(timeout=timeout_ms) cannot observe mission cancellation.
+    # Poll at a bounded interval while preserving the original hard deadline.
+    while True:
+        if cancellation is not None and cancellation.is_set():
+            cancelled = True
+            group_terminated = _terminate_process_group(process) or group_terminated
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            group_terminated = _terminate_process_group(process) or group_terminated
+            break
+        try:
+            process.wait(timeout=min(0.05, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
 
-    except subprocess.TimeoutExpired:
-        timed_out = True
-
-        group_terminated = (
-            _terminate_process_group(
-                process
-            )
-        )
+    # Closing the process group occurs BEFORE collectors are drained. Never
+    # report a cancelled invocation as successful, even on a zero exit code.
+    if cancellation is not None and cancellation.is_set():
+        cancelled = True
 
     stdout_thread.join(
         timeout=3.0
@@ -921,6 +948,7 @@ def _run_bounded_process(
             process.returncode
         ),
         "timed_out": timed_out,
+        "cancelled": cancelled,
         "process_group_terminated": (
             group_terminated
         ),
@@ -1645,6 +1673,7 @@ class ExecutionProposalStore:
         run_id: str,
         *,
         confirm_execution: bool = False,
+        cancellation: threading.Event | None = None,
     ) -> dict[str, Any]:
         # Phase 1:
         # validate and persist the immutable
@@ -1683,6 +1712,10 @@ class ExecutionProposalStore:
                     "Execution requires literal "
                     "confirm_execution=true"
                 )
+
+            if cancellation is not None and cancellation.is_set():
+                # Do not persist an execution attempt for pre-cancelled work.
+                raise ExecutionStateError("Execution cancelled before start")
 
             (
                 definition,
@@ -1862,6 +1895,7 @@ class ExecutionProposalStore:
                     cwd=root,
                     env=environment,
                     timeout_ms=timeout_ms,
+                    cancellation=cancellation,
                 )
             )
 
@@ -1932,7 +1966,13 @@ class ExecutionProposalStore:
                 f"{exc}"
             )
 
-        if result[
+        if (
+            result.get("cancelled")
+            or (cancellation is not None and cancellation.is_set())
+        ):
+            final_status = "CANCELLED"
+
+        elif result[
             "timed_out"
         ]:
             final_status = (
@@ -1968,6 +2008,12 @@ class ExecutionProposalStore:
                 )
             )
 
+            # Final cooperative fence: do not commit PASSED after cancellation
+            # has been observed. A truly atomic cancellation/commit boundary is
+            # a separate MissionControl integration gate.
+            if cancellation is not None and cancellation.is_set():
+                final_status = "CANCELLED"
+
             payload.update(
                 {
                     "exit_code": (
@@ -1980,6 +2026,7 @@ class ExecutionProposalStore:
                             "timed_out"
                         ]
                     ),
+                    "cancelled": final_status == "CANCELLED",
                     "process_group_terminated": (
                         result[
                             "process_group_terminated"
