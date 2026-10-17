@@ -333,13 +333,25 @@ class AutonomousQualificationService:
         self._cancel.set()
 
     def user_activity(self, active: bool) -> None:
+        # Foreground user inference always has priority over synthetic probes.
+        # Cancel first, then give an already-running local probe a very small
+        # bounded drain window so two CPU-heavy generations do not overlap.
         with self._lock:
             self._last_user_activity = time.monotonic()
             if active:
                 self._active_users += 1
                 self._cancel.set()
+                was_running = self._running
             else:
                 self._active_users = max(0, self._active_users - 1)
+                was_running = False
+        if active and was_running:
+            deadline = time.monotonic() + 0.45
+            while time.monotonic() < deadline:
+                with self._lock:
+                    if not self._running:
+                        break
+                time.sleep(0.01)
 
     def idle(self) -> bool:
         with self._lock:
@@ -460,9 +472,14 @@ class AutonomousQualificationService:
             self._cancel = cancel
             self._running = True
         started = time.monotonic()
+        # Fail closed, but never leave the daemon's bookkeeping variables
+        # undefined. Provider transports are external processes and may fail in
+        # ways not represented by our normal exception taxonomy.
+        outcome = 'error'
         details = None
-        failure_category = None
+        failure_category = 'execution_or_transport_error'
         finish_reason = None
+        error_type = None
         try:
             result = self.runner(descriptor, scenario(lang, kind), cancel, self.probe_timeout)
             if not isinstance(result, (tuple, list)) or len(result) not in {2, 3}:
@@ -476,9 +493,17 @@ class AutonomousQualificationService:
         except TimeoutError:
             outcome = 'cancelled' if cancel.is_set() else 'timeout'
             failure_category = 'generation_timeout'
-        except (RuntimeError, OSError, ValueError, TypeError):
+        except (RuntimeError, OSError, ValueError, TypeError) as exc:
             outcome = 'cancelled' if cancel.is_set() else 'error'
             failure_category = 'execution_or_transport_error'
+            error_type = type(exc).__name__
+        except Exception as exc:
+            # A background qualification failure must never terminate the
+            # autonomous service. Record a bounded diagnostic and continue on
+            # the next idle cycle. SystemExit/KeyboardInterrupt still escape.
+            outcome = 'cancelled' if cancel.is_set() else 'error'
+            failure_category = 'unexpected_probe_error'
+            error_type = type(exc).__name__
         finally:
             wall = (time.monotonic() - started) * 1000
             with self._lock:
@@ -491,6 +516,7 @@ class AutonomousQualificationService:
                     'outcome': outcome, 'duration_ms': round(wall, 2),
                     'failure_category': failure_category,
                     'finish_reason': str(finish_reason)[:32] if finish_reason else None,
+                    'error_type': error_type,
                 }
         if outcome != 'cancelled':
             record_probe(rid, version, lang, kind, outcome, wall,
@@ -506,7 +532,22 @@ class AutonomousQualificationService:
         # Never opens Core or starts a provider. Supplier returns [] before
         # a normal user mission has booted the system.
         while not self._stop.wait(5.0):
-            if self.run_one_if_idle():
+            try:
+                ran_probe = self.run_one_if_idle()
+            except Exception as exc:
+                # Defence in depth: inventory/scheduling bugs outside the
+                # provider-call guard must not silently kill the daemon either.
+                with self._lock:
+                    self._running = False
+                    self._last_result = 'scheduler_error'
+                    self._last_probe = {
+                        'outcome': 'error',
+                        'failure_category': 'qualification_scheduler_error',
+                        'error_type': type(exc).__name__,
+                    }
+                self._stop.wait(30.0)
+                continue
+            if ran_probe:
                 # Give user activity a chance to take precedence before next test.
                 self._stop.wait(30.0)
 

@@ -217,6 +217,16 @@ class MaestroCoreBridge:
                             registry.unregister(item.resource_id)
                     self._ollama_imported = False
                 self._catalog = catalogue
+                # FIXED5.8C proposed: publish ONLY catalogue SHA256 digests
+                # to the operational evidence cache. Unsupported local
+                # providers remain provisional, never version-certified.
+                from .model_qualification import update_verified_versions
+                update_verified_versions({
+                    f"{row['id']}::{model}": digest
+                    for row in catalogue if row.get("selection_enabled")
+                    for model, digest in
+                    (row.get("model_fingerprints") or {}).items()
+                })
                 # V8: model digest changes invalidate low-trust autonomous
                 # qualification evidence without any added Core dependency.
                 from .autonomous_qualification import update_model_versions

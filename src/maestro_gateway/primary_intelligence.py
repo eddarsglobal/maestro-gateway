@@ -19,9 +19,10 @@ from typing import Any
 
 from .adaptive_router import (
     RouteDecision, choose_adaptive_resource, classify_request,
-    _language_code,
+    _language_code, _size_bytes,
 )
-from .model_qualification import qualification
+from .model_qualification import qualification, task_qualification
+from .semantic_competence import semantic_qualification
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,14 @@ class PrimaryIntelligenceManager:
         # Prevent rapid primary oscillation on sparse or noisy real mission data.
         self._last_measured_switch_at = float("-inf")
         self._measured_switch_cooldown_seconds = 120.0
+        self._primary_selected_at = float("-inf")
+        # At most one provisional, real-user-request trial per local resource
+        # and task/language. Never run exploratory inference behind the UI.
+        self._provisional_trials: set[tuple[str, str, str]] = set()
+        # Deterministic semantic failures may trigger one bounded real-user
+        # recovery trial per subtask/language/resource. This is evidence-driven
+        # and provider-neutral; no model name is privileged.
+        self._semantic_trials: set[tuple[str, str, str]] = set()
 
     @staticmethod
     def _eligible_local(registry: Any, task_class: str) -> dict[str, Any]:
@@ -74,13 +83,13 @@ class PrimaryIntelligenceManager:
                 continue
             rid = str(rid)
             general[rid] = d
-            if ((task_class == 'code' and code)
-                    or (task_class in {'quick', 'normal'} and not code)):
+            if task_class == 'code' and code:
                 preferred[rid] = d
         return preferred if preferred else general
 
     def select(self, registry: Any, prompt: str, *, workspace_active: bool = False,
-               max_tokens: int = 512, ui_language: str | None = None) -> PrimarySelection:
+               max_tokens: int = 512, ui_language: str | None = None,
+               semantic_subtask: str | None = None) -> PrimarySelection:
         """Reuse the single primary; switch for proven task/language mismatch.
 
         This does not trigger a load, disk access, evaluation or network call.
@@ -123,19 +132,68 @@ class PrimaryIntelligenceManager:
                 candidate = choose_adaptive_resource(
                     _RestrictedRegistry(available.values()), prompt,
                     workspace_active=workspace_active, max_tokens=max_tokens,
-                    ui_language=ui_language)
+                    ui_language=ui_language, cold_start=True)
                 selected = candidate.resource_id
                 reason = "initial_selection" if self._primary is None else "resource_unavailable"
             else:
                 selected = old
                 reason = "primary_reused"
                 current_q = qualification(old, task, language)
-                if not current_q.qualified:
+                cross_language_q = task_qualification(old, task)
+
+                # V8.11.1: locally provable micro-subtasks carry stronger
+                # competence evidence than generic lexical acceptance. A known
+                # wrong model is never reused confidently for the same
+                # subtask/language, and a proven-good alternative may replace
+                # it without any provider/model-name heuristic.
+                if semantic_subtask is not None:
+                    current_semantic = semantic_qualification(
+                        old, semantic_subtask, language)
+                    proven = {rid: d for rid, d in available.items()
+                              if rid != old and semantic_qualification(
+                                  rid, semantic_subtask, language).qualified}
+                    if proven and (current_semantic.disqualified
+                                   or not current_semantic.qualified):
+                        best = choose_adaptive_resource(
+                            _RestrictedRegistry(proven.values()), prompt,
+                            workspace_active=workspace_active, max_tokens=max_tokens,
+                            ui_language=ui_language)
+                        selected = best.resource_id
+                        candidate = best
+                        reason = "semantic_competence_evidence"
+                    elif current_semantic.disqualified:
+                        # No proven replacement yet: one unknown local candidate
+                        # may be tried on this REAL request. Its answer remains
+                        # behind the deterministic semantic guard, so speed can
+                        # never promote a wrong answer.
+                        unknown = {rid: d for rid, d in available.items()
+                                   if rid != old
+                                   and (semantic_subtask, language, rid) not in self._semantic_trials
+                                   and not semantic_qualification(
+                                       rid, semantic_subtask, language).disqualified}
+                        if unknown:
+                            best = choose_adaptive_resource(
+                                _RestrictedRegistry(unknown.values()), prompt,
+                                workspace_active=workspace_active, max_tokens=max_tokens,
+                                ui_language=ui_language)
+                            selected = best.resource_id
+                            candidate = best
+                            reason = "semantic_recovery_trial"
+                            self._semantic_trials.add((semantic_subtask, language, selected))
+
+                if selected == old and not current_q.qualified:
                     # Only actual authenticated mission outcomes can justify
-                    # promoting an operationally qualified alternative. V8
-                    # synthetic one-word probes never select the primary.
-                    qualified = {rid: d for rid, d in available.items()
-                                 if rid != old and qualification(rid, task, language).qualified}
+                    # promoting an operationally qualified alternative. A
+                    # language change alone is NOT a competence failure: if the
+                    # incumbent has already completed this task class in another
+                    # language, reuse it once and let real current-language
+                    # evidence decide. This avoids needless cold primary swaps.
+                    language_only_unknown = (
+                        current_q.attempts == 0 and cross_language_q.accepted >= 1
+                    )
+                    qualified = ({rid: d for rid, d in available.items()
+                                  if rid != old and qualification(rid, task, language).qualified}
+                                 if not language_only_unknown else {})
                     if qualified:
                         best = choose_adaptive_resource(
                             _RestrictedRegistry(qualified.values()), prompt,
@@ -145,23 +203,41 @@ class PrimaryIntelligenceManager:
                             selected = best.resource_id
                             candidate = best
                             reason = "task_language_evidence"
-                elif now - self._last_measured_switch_at >= self._measured_switch_cooldown_seconds:
+                    # V8.6: one accepted real mission taking tens of seconds is
+                    # enough to prove that the current primary is operationally
+                    # too slow for ordinary conversation on this machine.
+                    if selected == old and current_q.accepted >= 1 and current_q.p95_ms is not None:
+                        trial = self._provisional_speed_trial(
+                            available, old, task, language, current_q, minimum_accepted=1)
+                        if trial is not None:
+                            selected = trial
+                            reason = "immediate_slow_primary_trial"
+                            self._provisional_trials.add((task, language, trial))
+                            self._last_measured_switch_at = now
+                elif selected == old and now - self._last_measured_switch_at >= self._measured_switch_cooldown_seconds:
                     # A successfully responding but very slow primary can be
                     # replaced ONLY with sufficiently sampled, same-task and
-                    # same-language REAL mission measurements. V8 synthetic
-                    # probe pass counts, model size and provider names never
-                    # establish language competence or latency superiority.
+                    # same-language REAL mission measurements.
                     candidate_id = self._measured_alternative(
                         available, old, task, language, current_q)
                     if candidate_id is not None:
                         selected = candidate_id
                         reason = "measured_operational_improvement"
                         self._last_measured_switch_at = now
+                    elif now - self._primary_selected_at >= self._measured_switch_cooldown_seconds:
+                        trial = self._provisional_speed_trial(
+                            available, old, task, language, current_q)
+                        if trial is not None:
+                            selected = trial
+                            reason = "bounded_provisional_speed_trial"
+                            self._provisional_trials.add((task, language, trial))
+                            self._last_measured_switch_at = now
 
             if selected != self._primary:
                 self._primary = selected
                 self._epoch += 1
                 self._inference_proven = False
+                self._primary_selected_at = now
             self._reason = reason
             q = qualification(selected, task, language)
             # Output tokens are a RESPONSE budget, not routing computation.
@@ -176,6 +252,43 @@ class PrimaryIntelligenceManager:
                 qualification_status="operationally_qualified" if q.qualified else "provisional",
                 language=language)
             return PrimarySelection(decision=decision, epoch=self._epoch, reason=reason)
+
+    def _provisional_speed_trial(self, available: dict[str, Any],
+                                 incumbent: str, task: str, language: str,
+                                 current: Any, *, minimum_accepted: int = 2) -> str | None:
+        """Escape a measured CPU-latency deadlock with ONE bounded trial.
+
+        Only quick/normal tasks, only after two successful real missions, only
+        if P95 is severely slow and a smaller eligible candidate exists. The
+        candidate is explicitly UNQUALIFIED; its outcome must be judged by the
+        normal governed mission response guard. No size-based language claims.
+        """
+        if task not in {'quick', 'normal'}:
+            return None
+        if (current.attempts < minimum_accepted
+                or current.accepted < minimum_accepted
+                or current.p95_ms is None):
+            return None
+        limit_ms = 12_000.0 if task == 'quick' else 25_000.0
+        if current.p95_ms < limit_ms:
+            return None
+        incumbent_size = _size_bytes(available[incumbent])
+        if not incumbent_size:
+            return None
+        choices: list[tuple[int, bytes, str]] = []
+        min_size = 750_000_000 if task == 'quick' else 1_100_000_000
+        for rid, descriptor in available.items():
+            if rid == incumbent or (task, language, rid) in self._provisional_trials:
+                continue
+            other_q = qualification(rid, task, language)
+            # Proven alternatives continue to use measured safety checks.
+            if other_q.attempts:
+                continue
+            size = _size_bytes(descriptor)
+            if not (min_size <= size <= incumbent_size * .60):
+                continue
+            choices.append((size, hashlib.blake2s(rid.encode(), digest_size=8).digest(), rid))
+        return min(choices)[2] if choices else None
 
     @staticmethod
     def _measured_alternative(available: dict[str, Any], incumbent: str,
@@ -218,7 +331,7 @@ class PrimaryIntelligenceManager:
     def failover(self, *, failed_id: str, replacement_id: str | None,
                  expected_epoch: int, registry: Any, reason: str) -> bool:
         """Compare-and-swap prevents late parallel attempts undoing a switch."""
-        if reason not in {"timeout", "transport_failure", "quality_rejected"}:
+        if reason not in {"timeout", "transport_failure", "quality_rejected", "semantic_rejected"}:
             raise ValueError("Unsupported primary switch reason")
         with self._lock:
             if self._epoch != expected_epoch or self._primary != failed_id:
@@ -229,7 +342,11 @@ class PrimaryIntelligenceManager:
                 if (replacement_id not in allowed or replacement_id == failed_id
                         or self._quarantine.get(replacement_id, 0.0) > time.monotonic()):
                     return False
-            self._quarantine[failed_id] = time.monotonic() + self._cooldown_seconds
+            # A deterministic semantic mismatch is scoped to one micro-subtask;
+            # do not globally quarantine an otherwise useful primary. Transport
+            # and generic quality failures keep the existing bounded cooldown.
+            if reason != "semantic_rejected":
+                self._quarantine[failed_id] = time.monotonic() + self._cooldown_seconds
             # None invalidates the failed model, forcing requalification/choice
             # on the next request. This does not claim a replacement succeeded.
             self._primary = replacement_id

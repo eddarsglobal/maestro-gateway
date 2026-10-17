@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from .response_constraints import evaluate_shape
 
 
 # An imperative request to reproduce text is different from a frustrated
@@ -238,6 +239,65 @@ def _unverified_capability_claim(output: str, capability_snapshot: list[dict] | 
     return None
 
 
+
+# FIXED5.8G1 — narrow, independently inspectable evidence. A format test never
+# proves factual accuracy, meaning or language fluency. Unknown remains unknown.
+_TWO_PARAGRAPHS = re.compile(
+    r"(?:\b(?:en\s+(?:exactement\s+)?deux\s+paragraphes|"
+    r"(?:in\s+(?:exactly\s+)?|exactly\s+)two\s+paragraphs|"
+    r"(?:in\s+)?(?:genau\s+)?zwei\s+abs[aä]tzen?|"
+    r"em\s+(?:exatamente\s+)?dois\s+par[aá]grafos|"
+    r"en\s+(?:exactamente\s+)?dos\s+p[aá]rrafos|"
+    r"u\s+(?:to[cč]no\s+)?dva\s+(?:odlomka|paragrafa)|"
+    r"in\s+(?:esattamente\s+)?due\s+paragrafi)\b|"
+    r"(?:في\s+فقرتين|فقرتين\s+فقط|من\s+فقرتين))",
+    re.IGNORECASE,
+)
+_DIGITS_ONLY = re.compile(
+    r"(?:\b(?:digits?\s+only|only\s+digits?|"
+    r"only\s+(?:the\s+)?(?:integer|number)|"
+    r"r[eé]ponds?\s+uniquement\s+(?:par|avec)\s+(?:le\s+)?(?:nombre|chiffres?|r[eé]sultat)|"
+    r"(?:en\s+chiffres?)\s+uniquement|"
+    r"nur\s+(?:mit\s+)?(?:ziffern|die\s+zahl)|"
+    r"samo\s+(?:znamenkama|brojem)|"
+    r"solo\s+(?:con\s+)?(?:cifras|n[uú]mero)|"
+    r"apenas\s+(?:com\s+)?(?:algarismos|n[uú]mero)|"
+    r"solo\s+(?:con\s+)?(?:le\s+)?(?:cifre|numero))\b|"
+    r"(?:بالأرقام\s+فقط|بالارقام\s+فقط|الرقم\s+فقط))",
+    re.IGNORECASE,
+)
+_LENGTH_REASONS = frozenset({'length', 'max_tokens', 'max_output_tokens', 'token_limit'})
+
+
+def explicit_format_evidence(prompt: str, output: str, completion_reason: str | None = None) -> dict:
+    """Pure bounded evidence. A missing contract/finish code is *unknown*, not PASS.
+
+    Returns no text, name, vendor, raw output or conversation content.
+    This deliberately does not infer mathematical correctness from seeing digits.
+    """
+    instruction = str(prompt or '')
+    answer = str(output or '').strip()
+    finish = str(completion_reason or '').strip().casefold()
+    completion = ('truncated' if finish in _LENGTH_REASONS
+                  else 'complete_reported' if finish in {'stop', 'eos', 'end_turn', 'end'}
+                  else 'unverified')
+    contract = None
+    conform = 'unverified'
+    if _TWO_PARAGRAPHS.search(instruction):
+        contract = 'two_paragraphs'
+        # Count prose paragraphs, not newline-wrapped lines. Explicit markdown
+        # tables, lists, and standalone headings are outside this contract.
+        blocks = [x.strip() for x in re.split(r'\n[ \t]*\n+', answer) if x.strip()]
+        bad = re.compile(r'(?m)^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|\|.*\||```|\*\*[^*]+\*\*\s*$)')
+        conform = 'pass' if len(blocks) == 2 and all(not bad.search(b) for b in blocks) else 'fail'
+    elif _DIGITS_ONLY.search(instruction):
+        contract = 'digits_only'
+        conform = 'pass' if bool(re.fullmatch(r'[0-9]+', answer)) else 'fail'
+    return {'schema': 'v8.11.5-fixed58g1', 'format_contract': contract,
+            'format_conformance': conform, 'completion': completion,
+            'deterministic_truth': 'not_assessed_here',
+            'general_semantic_truth': 'not_verified'}
+
 def evaluate_response(
     prompt: str,
     output: str,
@@ -265,6 +325,12 @@ def evaluate_response(
             "empty_output",
             1.0,
         )
+
+    # FIXED5.8G1: enforce only objectively testable explicit response shapes.
+    # Do not assume other unconstrained answers are correct or compliant.
+    shape_evidence = explicit_format_evidence(prompt, output, completion_reason)
+    if shape_evidence["format_conformance"] == "fail":
+        return QualityResult(False, "explicit_format_" + shape_evidence["format_contract"], 0.0)
 
     if (explicit_repeat_request(prompt)
             and not asks_about_capabilities(prompt)
@@ -382,6 +448,12 @@ def evaluate_response(
             "near_prompt_echo",
             similarity,
         )
+
+    # FIXED5.1: enforce narrowly provable output structure before delivery.
+    # PASS_SHAPE is NOT a factual or linguistic truth certificate.
+    shape = evaluate_shape(prompt, output)
+    if shape.status == "FAIL_SHAPE":
+        return QualityResult(False, "explicit_shape_" + shape.reason, similarity)
 
     return QualityResult(
         True,

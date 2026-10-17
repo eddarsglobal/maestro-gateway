@@ -1,5 +1,6 @@
 """V8.2 sovereign primary selection from actual operational mission evidence."""
 from __future__ import annotations
+import hashlib
 
 import time
 import unittest
@@ -25,18 +26,29 @@ class Registry:
         return tuple(self.items)
 
 
+# FIXED5.8C: synthetic immutable digests ONLY for isolated test descriptors.
+_TEST_RESOURCE_IDS = ('local-one::A', 'local-three::C', 'local-two::B')
+def _test_model_fingerprint(rid: str) -> str:
+    return hashlib.sha256(('maestro/fixed58c/testing-only\0' + rid).encode('utf-8')).hexdigest()
+def _activate_test_versions() -> None:
+    model_qualification.update_verified_versions({
+        rid: _test_model_fingerprint(rid) for rid in _TEST_RESOURCE_IDS
+    })
+
+
 def learn(rid, *, task='quick', language='en', accepted=8, failures=0, ms=5000):
     for _ in range(accepted):
         assert model_qualification.observe_attempt(rid, task, language,
-                                                   'quality_accepted', ms)
+                                                   'quality_accepted', ms, model_fingerprint=_test_model_fingerprint(rid))
     for _ in range(failures):
         assert model_qualification.observe_attempt(rid, task, language,
-                                                   'quality_rejected', ms)
+                                                   'quality_rejected', ms, model_fingerprint=_test_model_fingerprint(rid))
 
 
 class V82MeasuredSwitchTests(unittest.TestCase):
     def setUp(self):
         model_qualification.reset_for_testing()
+        _activate_test_versions()
         autonomous_qualification.reset_for_testing()
         self.a = Descriptor('local-one::A')
         self.b = Descriptor('local-two::B')

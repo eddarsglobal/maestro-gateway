@@ -56,6 +56,7 @@ from .provider_inventory import discover_runtime_inventory
 from .autonomous_qualification import (AutonomousQualificationService,
     execute_local_probe, model_version, update_model_versions,
     probe_evidence, LANGUAGES)
+from .qualification_inspection import inspect_operational_evidence
 from .terminal import (
     TERMINAL_MODE,
     TERMINAL_PROTOCOL,
@@ -1075,6 +1076,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "sources": len([row for row in inventory if row.get("selection_enabled")]),
                 "primary": self.server.core.primary_intelligence.snapshot(),
                 "autonomous_qualification": self.server.autonomous_qualification.status(),
+                "operational_qualification_evidence": inspect_operational_evidence(
+                    self.server.core.system.sovereign_intelligence.registry.all()),
                 "qualification_evidence": [
                     {"resource_id": d.resource_id,
                      "languages": {lang: probe_evidence(d.resource_id,
