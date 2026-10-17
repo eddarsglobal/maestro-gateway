@@ -1,0 +1,79 @@
+name: MAESTRO Gateway - Development CI
+
+on:
+  push:
+    branches:
+      - 'dev/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gateway-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gateway-regressions:
+    name: Gateway Python regressions (not production certification)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Gateway
+        uses: actions/checkout@v4
+        with:
+          path: maestro-gateway
+          persist-credentials: false
+      - name: Checkout matching MAESTRO Core (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: eddarsglobal/maestro
+          ref: 02c1a88e601d6b9da2aacb6a33d5fb81c3f95a65
+          path: maestro
+          persist-credentials: false
+          token: ${{ secrets.MAESTRO_CROSS_REPO_READ_TOKEN || github.token }}
+      - name: Verify exact Core commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C maestro rev-parse HEAD)" = '02c1a88e601d6b9da2aacb6a33d5fb81c3f95a65'
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install declared dependencies, if any
+        shell: bash
+        run: |
+          set -euo pipefail
+          for REPO in maestro maestro-gateway; do
+            if [[ -f "$REPO/requirements.txt" ]]; then
+              python -m pip install -r "$REPO/requirements.txt"
+            fi
+            if [[ -f "$REPO/pyproject.toml" || -f "$REPO/setup.py" ]]; then
+              python -m pip install -e "./$REPO"
+            fi
+          done
+      - name: Run complete Gateway unittest suite; require 354+
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/maestro/src:${{ github.workspace }}/maestro-gateway/src
+          PYTHONDONTWRITEBYTECODE: '1'
+        working-directory: maestro-gateway
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/maestro-gateway-tests.log"
+          if ! python -m unittest discover -s tests -p 'test_*.py' -q > "$LOG" 2>&1; then
+            tail -n 150 "$LOG"
+            exit 1
+          fi
+          tail -n 25 "$LOG"
+          python - "$LOG" <<'PY'
+          import pathlib, re, sys
+          content = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
+          found = re.findall(r'Ran (\d+) tests? in ', content)
+          assert found and int(found[-1]) >= 354, f'Gateway coverage too low or missing summary: {found!r}'
+          print(f'GATEWAY FULL REGRESSION PASS: {found[-1]} tests')
+          PY
