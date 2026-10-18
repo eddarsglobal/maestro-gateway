@@ -1243,13 +1243,9 @@ class GovernedDirectMissionRunner:
                 previous_messages
             )
 
-            conversation = (
-                self._conversations.append_message(
-                    conversation["id"],
-                    role="user",
-                    content=prompt,
-                )
-            )
+            # Keep the current user input in the mission's in-memory prompt.
+            # Publishing it here would leak a half-finished turn if cancelled
+            # before the Core verdict. Conversation publication occurs below.
 
             active_workspace = None
 
@@ -2735,24 +2731,33 @@ class GovernedDirectMissionRunner:
             }
 
             if passed:
-                conversation = (
-                    self._conversations.append_message(
-                        conversation["id"],
-                        role="assistant",
-                        content=output,
-                        metadata={"mission": result},
-                    )
+                # Publish user + assistant as one conversation-file revision,
+                # only AFTER Core has returned its durable verdict. A late
+                # cancel after proven Core commit cannot erase that commitment.
+                conversation = self._conversations.append_messages(
+                    conversation["id"], messages=[
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": output,
+                         "metadata": {"mission": result}},
+                    ],
                 )
                 result["conversation_title"] = conversation["title"]
-            elif resource_calls:
-                # Preserve bounded model attempt evidence even if both
-                # calls timed out. A hidden system event is not a user-facing
-                # assistant answer and is excluded from conversational prompts.
-                self._conversations.append_message(
-                    conversation["id"],
-                    role="system", content="MAESTRO_MISSION_FAILED",
-                    metadata={"mission": result},
+            elif cancellation is None or not cancellation.is_set():
+                # A failed, non-cancelled attempt remains visible. Preserve
+                # model-failure telemetry as a hidden system entry in the same
+                # atomic publication, never as a dangling user-only write.
+                messages = [{"role": "user", "content": prompt}]
+                if resource_calls:
+                    messages.append({
+                        "role": "system", "content": "MAESTRO_MISSION_FAILED",
+                        "metadata": {"mission": result},
+                    })
+                conversation = self._conversations.append_messages(
+                    conversation["id"], messages=messages,
                 )
+                result["conversation_title"] = conversation["title"]
+            # An observed cancellation before the Core verdict publishes no
+            # conversation turn. This does NOT roll back Workspace effects.
 
             # Record trusted Gateway observations after the governed verdict.
             # No chat content or user prompt is sent to the qualification store.

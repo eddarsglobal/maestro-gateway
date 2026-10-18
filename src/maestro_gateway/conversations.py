@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import uuid
@@ -41,6 +42,8 @@ def provisional_title(text: str, limit: int = 58) -> str:
 class ConversationStore:
     def __init__(self, root: Path):
         self.root = Path(root).expanduser()
+        if self.root.is_symlink():
+            raise ValueError("Symlinked conversation directory refused")
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
 
@@ -51,6 +54,8 @@ class ConversationStore:
         return self.root / f"{value}.json"
 
     def _read_path(self, path: Path) -> dict[str, Any]:
+        if path.is_symlink():
+            raise ValueError("Symlinked conversation record refused")
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
@@ -62,19 +67,36 @@ class ConversationStore:
         return payload
 
     def _write(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Atomic one-conversation publication, durable on fsync-capable filesystems.
+
+        This is not an atomic transaction with the Core or Workspace. Only one
+        Gateway process may own this store; filesystem-level locking between
+        independent Gateway processes is not provided here.
+        """
         path = self._path(str(record["id"]))
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(
-                record,
-                ensure_ascii=False,
-                sort_keys=True,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        tmp.replace(path)
+        if path.is_symlink():
+            raise ValueError("Symlinked conversation record refused")
+        data = (json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2)
+                + "\n").encode("utf-8")
+        tmp = self.root / (path.name + "." + uuid.uuid4().hex + ".tmp")
+        fd = None
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                fd = None
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            dir_fd = os.open(self.root, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            tmp.unlink(missing_ok=True)
         return record
 
     def create(
@@ -118,6 +140,52 @@ class ConversationStore:
         with self._lock:
             return self._read_path(self._path(conversation_id))
 
+    def append_messages(
+        self,
+        conversation_id: str,
+        *,
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Validate then publish all messages with exactly one atomic rename.
+
+        Caller must invoke only after the governed mission outcome is known.
+        A crash before rename leaves no partial turn; after rename the entire
+        turn is visible. A Core transaction may already have committed; this
+        method does NOT promise cross-store atomicity.
+        """
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("Messages must be a nonempty list")
+        validated = []
+        for item in messages:
+            if not isinstance(item, dict) or item.get("role") not in {"user", "assistant", "system"}:
+                raise ValueError("Invalid conversation message role")
+            content = str(item.get("content") or "").strip()
+            if not content:
+                raise ValueError("Conversation message content must not be empty")
+            metadata = item.get("metadata", {})
+            if metadata is None:
+                metadata = {}
+            if not isinstance(metadata, dict):
+                raise ValueError("Conversation metadata must be an object")
+            validated.append((item["role"], content, metadata))
+
+        with self._lock:
+            record = self.get(conversation_id)
+            if not isinstance(record.get("messages"), list):
+                raise ValueError("Invalid conversation messages collection")
+            now = _utc_now()
+            for role, content, metadata in validated:
+                record["messages"].append({
+                    "id": "MSG-" + uuid.uuid4().hex[:12].upper(),
+                    "role": role, "content": content,
+                    "created_at": now, "metadata": metadata,
+                })
+                if (role == "user" and len(record["messages"]) == 1
+                        and record.get("title") in {"", "New chat"}):
+                    record["title"] = provisional_title(content)
+            record["updated_at"] = now
+            return self._write(record)
+
     def append_message(
         self,
         conversation_id: str,
@@ -126,36 +194,10 @@ class ConversationStore:
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if role not in {"user", "assistant", "system"}:
-            raise ValueError("Invalid conversation message role")
-
-        text = str(content or "").strip()
-        if not text:
-            raise ValueError("Conversation message content must not be empty")
-
-        with self._lock:
-            record = self.get(conversation_id)
-            now = _utc_now()
-
-            record["messages"].append(
-                {
-                    "id": "MSG-" + uuid.uuid4().hex[:12].upper(),
-                    "role": role,
-                    "content": text,
-                    "created_at": now,
-                    "metadata": metadata or {},
-                }
-            )
-            record["updated_at"] = now
-
-            if (
-                role == "user"
-                and len(record["messages"]) == 1
-                and record.get("title") in {"", "New chat"}
-            ):
-                record["title"] = provisional_title(text)
-
-            return self._write(record)
+        return self.append_messages(
+            conversation_id,
+            messages=[{"role": role, "content": content, "metadata": metadata or {}}],
+        )
 
     def update(
         self,
