@@ -13,6 +13,7 @@ from .sensitive_policy import (
     is_sensitive_path as _is_sensitive,
 )
 from .git_inspection import inspect_git as inspect_git_repository
+from .mission_control import MissionCancelledError
 from .terminal import run_inspection_command
 
 
@@ -707,6 +708,7 @@ class WorkspaceRegistry:
         argv: Any,
         cwd: str = ".",
         timeout_ms: Any = 3000,
+        cancellation: threading.Event | None = None,
     ) -> dict[str, Any]:
         row, selected = self._scope(
             workspace_id
@@ -732,8 +734,11 @@ class WorkspaceRegistry:
             cwd=workdir,
             argv=argv,
             timeout_ms=timeout_ms,
+            cancellation=cancellation,
         )
 
+        if cancellation is not None and cancellation.is_set():
+            raise MissionCancelledError("Workspace terminal result cancelled")
         return {
             "workspace_id": row["id"],
             **result,
@@ -772,7 +777,11 @@ class WorkspaceRegistry:
         workspace_id: str,
         name: str,
         arguments: dict[str, Any],
+        *,
+        cancellation: threading.Event | None = None,
     ) -> dict[str, Any]:
+        if cancellation is not None and cancellation.is_set():
+            raise MissionCancelledError("Workspace tool cancelled before dispatch")
         if name == "workspace.tree":
             return self.tree(
                 workspace_id,
@@ -823,6 +832,7 @@ class WorkspaceRegistry:
                     "timeout_ms",
                     3000,
                 ),
+                cancellation=cancellation,
             )
 
         raise ValueError(

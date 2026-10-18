@@ -2049,9 +2049,14 @@ class GovernedDirectMissionRunner:
                                         active_workspace["id"],
                                         tool_name,
                                         arguments,
+                                        cancellation=cancellation,
                                     )
                                 )
 
+                                if cancellation is not None and cancellation.is_set():
+                                    raise MissionCancelledError(
+                                        "Mission cancelled after workspace tool"
+                                    )
                                 attempt["ok"] = True
 
                                 if isinstance(

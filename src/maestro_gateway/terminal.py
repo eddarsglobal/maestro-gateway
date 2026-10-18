@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from .mission_control import MissionCancelledError
 
 
 TERMINAL_PROTOCOL = "P0.6D.1"
@@ -430,12 +434,101 @@ def _plan_command(
     )
 
 
+
+def _cancel_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Stop only this invocation's isolated process group, including children.
+
+    SIGTERM is followed by SIGKILL even if the group leader exited: an
+    inherited pipe or child process must not survive a cancelled terminal call.
+    """
+    if os.name == "posix":
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                pass
+            # PermissionError must propagate; never claim successful abort.
+            if sig == signal.SIGTERM:
+                try:
+                    process.wait(timeout=0.15)
+                except subprocess.TimeoutExpired:
+                    pass
+    else:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=0.15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def _run_cancelable_inspection(
+    planned_argv: list[str],
+    workdir: Path,
+    environment: dict[str, str],
+    timeout: int,
+    cancellation: threading.Event,
+) -> subprocess.CompletedProcess[bytes]:
+    """P0.6D.1 run with mission-scoped cooperative 50 ms cancellation.
+
+    This covers process lifetime, not atomic external filesystem rollback.
+    """
+    if cancellation.is_set():
+        raise MissionCancelledError("terminal.run cancelled before process launch")
+    process = subprocess.Popen(
+        planned_argv,
+        cwd=str(workdir),
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        close_fds=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout / 1000.0
+    aborted = False
+    try:
+        while True:
+            if cancellation.is_set():
+                aborted = True
+                raise MissionCancelledError("terminal.run cancelled during execution")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                aborted = True
+                raise TimeoutError(f"terminal.run exceeded {timeout} ms")
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+                if cancellation.is_set():
+                    aborted = True
+                    raise MissionCancelledError("terminal.run cancelled before result delivery")
+                return subprocess.CompletedProcess(
+                    planned_argv, process.returncode, stdout, stderr
+                )
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if aborted or cancellation.is_set():
+            _cancel_process_group(process)
+            # Reap the group leader and drain pipes, but never wait indefinitely.
+            try:
+                process.communicate(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                _cancel_process_group(process)
+                try:
+                    process.communicate(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    # Fail closed; the caller cannot claim completed execution.
+                    raise RuntimeError("terminal.run cancelled but pipes did not close")
+
+
 def run_inspection_command(
     *,
     workspace_root: Path,
     cwd: Path,
     argv: list[str],
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    cancellation: threading.Event | None = None,
 ) -> dict[str, Any]:
     root = Path(
         workspace_root
@@ -512,26 +605,34 @@ def run_inspection_command(
 
     started = time.perf_counter()
 
-    try:
-        completed = subprocess.run(
-            planned_argv,
-            cwd=str(workdir),
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            check=False,
-            timeout=timeout / 1000.0,
-            close_fds=True,
-            start_new_session=True,
+    if cancellation is None:
+        # Preserve legacy inspection behavior for calls without a mission ID.
+        try:
+            completed = subprocess.run(
+                planned_argv,
+                cwd=str(workdir),
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                check=False,
+                timeout=timeout / 1000.0,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                "terminal.run exceeded "
+                f"{timeout} ms"
+            ) from exc
+    else:
+        completed = _run_cancelable_inspection(
+            planned_argv, workdir, environment, timeout, cancellation
         )
 
-    except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(
-            "terminal.run exceeded "
-            f"{timeout} ms"
-        ) from exc
+    if cancellation is not None and cancellation.is_set():
+        raise MissionCancelledError("terminal.run cancelled before evidence recording")
 
     duration_ms = int(
         (
@@ -624,6 +725,9 @@ def run_inspection_command(
             stderr_truncated
         ),
     }
+
+    if cancellation is not None and cancellation.is_set():
+        raise MissionCancelledError("terminal.run cancelled before returning result")
 
     return {
         "protocol": TERMINAL_PROTOCOL,
