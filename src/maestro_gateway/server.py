@@ -2337,6 +2337,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         self.server.mission_control.finish(
                             request_id, success=bool(result and result.get("ok")),
                             cancelled=cancellation.is_set(),
+                            durable_committed=bool(result and result.get("tx_committed")),
                         )
             except MissionConflictError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error":"duplicate_mission_request", "message":str(exc)})
