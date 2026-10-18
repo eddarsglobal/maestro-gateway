@@ -31,7 +31,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: eddarsglobal/maestro
-          ref: 9703e54d1903c5ca7e53e824c5e0718419c780c4
+          ref: e46ef5a7e8576b758290c0b5f6f5309449d479e1
           path: maestro
           persist-credentials: false
           token: ${{ secrets.MAESTRO_CROSS_REPO_READ_TOKEN || github.token }}
@@ -39,7 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C maestro rev-parse HEAD)" = '9703e54d1903c5ca7e53e824c5e0718419c780c4'
+          test "$(git -C maestro rev-parse HEAD)" = 'e46ef5a7e8576b758290c0b5f6f5309449d479e1'
       - name: Python 3.11
         uses: actions/setup-python@v5
         with:
