@@ -38,7 +38,8 @@ fingerprint = journal_mod.fingerprint
 
 # Compile the actual run wrapper for isolation from the unavailable Core
 # imports. No approximated implementation of its control flow is used.
-tree = ast.parse((SRC / 'mission.py').read_text())
+tree = ast.parse((SRC / 'mission.py' if (SRC / 'mission.py').is_file()
+                  else BASE.parent / 'fixtures/mission.py').read_text())
 runner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'GovernedDirectMissionRunner')
 run_func = next(node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == 'run')
 namespace = dict(Any=object, MissionRequestJournal=MissionRequestJournal,
@@ -265,6 +266,41 @@ class JournalTests(unittest.TestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(runner.calls, 1)
         self.assertEqual(len(successes) + len(errors), 8)
+
+    def test_parallel_journal_initialization_and_same_request(self):
+        # Stress creating .mission_requests itself, not only one lock file.
+        for trial in range(15):
+            with tempfile.TemporaryDirectory() as temp:
+                store = conv_mod.ConversationStore(Path(temp) / 'chats')
+                r = RunnerHarness(store, task=f'TASK-STRESS-{trial}')
+                gate = threading.Barrier(8)
+                results = []
+                errors = []
+                def work():
+                    try:
+                        gate.wait(timeout=3)
+                        results.append(r.run(prompt='parallel', request_id='REQ-STRESS-1'))
+                    except RequestReplayBlocked as exc:
+                        errors.append(exc)
+                    except BaseException as exc:
+                        errors.append(exc)
+                threads = [threading.Thread(target=work) for _ in range(8)]
+                for th in threads: th.start()
+                for th in threads: th.join(timeout=5)
+                self.assertFalse(any(th.is_alive() for th in threads))
+                self.assertEqual(r.calls, 1, f'trial {trial}: {errors!r}')
+                self.assertTrue(results)
+                self.assertTrue(all(isinstance(e, RequestReplayBlocked) for e in errors), errors)
+                self.assertEqual(len(results) + len(errors), 8)
+
+    def test_initialization_lock_symlink_refused(self):
+        other = self.root / 'outside-init'
+        other.write_text('untouched')
+        bootstrap = self.journal.root / '.initialization.lock'
+        bootstrap.symlink_to(other)
+        with self.assertRaises((OSError, RequestReplayBlocked)):
+            RunnerHarness(self.store).run(prompt='hi', request_id='REQ-SYMLINK-INIT')
+        self.assertEqual(other.read_text(), 'untouched')
 
     def test_receipt_permissions_private(self):
         r=RunnerHarness(self.store)

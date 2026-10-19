@@ -8,12 +8,14 @@ separate Gateway hosts are not certified. All uncertain outcomes block replay.
 from __future__ import annotations
 
 import fcntl
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -54,6 +56,42 @@ def _verify_root(root: Path) -> None:
     mode = stat.S_IMODE(root.stat().st_mode)
     if mode & 0o077:
         raise RuntimeError('Request journal directory permits group/other access')
+
+
+@contextmanager
+def _initialization_guard(root: Path):
+    """Serialize creation+locking+first receipt publication across processes.
+
+    Without this guard, the creator of a per-request .lock can be preempted
+    before flock(). A later contender can take the flock first, observe a
+    missing receipt, and cause *every* concurrent request to fail closed.
+    The global gate protects initialization only, never the Core execution.
+    """
+    _verify_root(root)
+    path = root / '.initialization.lock'
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(path, flags, 0o600)
+    owned = False
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or
+                (stat.S_IMODE(info.st_mode) & 0o077) or info.st_nlink != 1):
+            raise RequestReplayBlocked('Insecure journal initialization lock')
+        deadline = time.monotonic() + 3.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                owned = True
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise RequestReplayBlocked('Journal initialization busy') from exc
+                time.sleep(0.01)
+        yield
+    finally:
+        if owned:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _no_follow_read(path: Path) -> bytes:
@@ -141,41 +179,45 @@ class RequestLease:
         self._closed = False
 
     def __enter__(self) -> 'RequestLease':
-        _verify_root(self.root)
-        if self.lock_path.is_symlink():
-            raise RequestReplayBlocked('Symlinked request lock refused')
-        # A lock file is a durable tombstone: missing receipt + prior lock
-        # means uncertain history, never a fresh, safe-to-execute request.
-        flags = os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
-        try:
-            self.fd = os.open(self.lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-            lock_created = True
-        except FileExistsError:
-            self.fd = os.open(self.lock_path, flags)
-            lock_created = False
-        try:
-            st = os.fstat(self.fd)
-            if not stat.S_ISREG(st.st_mode) or (stat.S_IMODE(st.st_mode) & 0o077):
-                raise RequestReplayBlocked('Insecure request lock')
+        # The initialization lock must cover the per-request lock creation,
+        # ownership acquisition, and initial durable receipt. The per-request
+        # lease remains locked after this short global initialization gate.
+        with _initialization_guard(self.root):
+            _verify_root(self.root)
+            if self.lock_path.is_symlink():
+                raise RequestReplayBlocked('Symlinked request lock refused')
+            # A lock file is a durable tombstone: missing receipt + prior lock
+            # means uncertain history, never a fresh, safe-to-execute request.
+            flags = os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
             try:
-                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise RequestReplayBlocked('Identical request already active') from exc
+                self.fd = os.open(self.lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+                lock_created = True
+            except FileExistsError:
+                self.fd = os.open(self.lock_path, flags)
+                lock_created = False
             try:
-                doc = json.loads(_no_follow_read(self.path))
-            except FileNotFoundError:
-                if not lock_created:
-                    raise RequestReplayBlocked('Receipt missing for existing request lock; no replay')
-                _atomic_write(self.path, _make_record(self.request_hash, self.request_fingerprint,
-                                                     'STARTED_UNCERTAIN'))
-            except (ValueError, UnicodeError) as exc:
-                raise RequestReplayBlocked('Malformed request receipt') from exc
-            else:
-                self.existing = _check_record(doc, self.request_hash, self.request_fingerprint)
-            return self
-        except BaseException:
-            self.close()
-            raise
+                st = os.fstat(self.fd)
+                if not stat.S_ISREG(st.st_mode) or (stat.S_IMODE(st.st_mode) & 0o077):
+                    raise RequestReplayBlocked('Insecure request lock')
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise RequestReplayBlocked('Identical request already active') from exc
+                try:
+                    doc = json.loads(_no_follow_read(self.path))
+                except FileNotFoundError:
+                    if not lock_created:
+                        raise RequestReplayBlocked('Receipt missing for existing request lock; no replay')
+                    _atomic_write(self.path, _make_record(self.request_hash, self.request_fingerprint,
+                                                         'STARTED_UNCERTAIN'))
+                except (ValueError, UnicodeError) as exc:
+                    raise RequestReplayBlocked('Malformed request receipt') from exc
+                else:
+                    self.existing = _check_record(doc, self.request_hash, self.request_fingerprint)
+                return self
+            except BaseException:
+                self.close()
+                raise
 
     def _transition(self, state: str, *, result: dict[str, Any] | None = None,
                     detail: str | None = None) -> None:
@@ -221,15 +263,15 @@ class MissionRequestJournal:
         self.root = chat_root / '.mission_requests'
         if self.root.is_symlink():
             raise RuntimeError('Symlinked request journal refused')
-        if not self.root.exists():
-            self.root.mkdir(mode=0o700)
-            # Parent directory fsync makes the new journal directory durable.
-            fd = os.open(chat_root, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        self.root.mkdir(mode=0o700, exist_ok=True)
         _verify_root(self.root)
+        # Every contender fsyncs the parent before accessing the journal:
+        # another thread may have created the directory moments earlier.
+        fd = os.open(chat_root, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _request_hash(request_id: str) -> str:
