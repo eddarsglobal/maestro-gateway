@@ -140,11 +140,78 @@ class ConversationStore:
         with self._lock:
             return self._read_path(self._path(conversation_id))
 
+    @staticmethod
+    def _validate_mission_id(mission_id: str) -> str:
+        if not isinstance(mission_id, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}", mission_id):
+            raise ValueError("Invalid mission id")
+        return mission_id
+
+    @staticmethod
+    def _mission_digest(entries: list[tuple[str, str, dict[str, Any]]]) -> str:
+        """Fingerprint the exact logical turn, rejecting ambiguous JSON values."""
+        import hashlib
+        value = [{"role": role, "content": content, "metadata": meta}
+                 for role, content, meta in entries]
+        encoded = json.dumps(value, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _mission_receipt_state(self, record: dict[str, Any], mission_id: str) -> dict[str, Any]:
+        receipts = record.get("mission_turns", {})
+        if not isinstance(receipts, dict):
+            raise ValueError("Invalid mission receipts collection")
+        messages = record.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError("Invalid conversation messages collection")
+        receipt = receipts.get(mission_id)
+        if receipt is None:
+            # Earlier releases stored the Core task id in assistant metadata,
+            # without a receipt. Never automatically duplicate such a turn.
+            for item in messages:
+                if not isinstance(item, dict):
+                    raise ValueError("Invalid stored conversation message")
+                meta = item.get("metadata", {})
+                if isinstance(meta, dict) and isinstance(meta.get("mission"), dict):
+                    if meta["mission"].get("task_id") == mission_id:
+                        return {"status": "LEGACY_UNCERTAIN", "mission_id": mission_id}
+            return {"status": "ABSENT", "mission_id": mission_id}
+        if not isinstance(receipt, dict):
+            raise ValueError("Invalid mission receipt")
+        start, count, digest = (receipt.get("start"), receipt.get("count"),
+                                receipt.get("sha256"))
+        if (type(start) is not int or type(count) is not int or start < 0
+                or count < 1 or start + count > len(messages)
+                or not isinstance(digest, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", digest)):
+            raise ValueError("Corrupt mission receipt")
+        extracted = []
+        for item in messages[start:start + count]:
+            if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
+                raise ValueError("Corrupt receipted message")
+            extracted.append((item.get("role"), item.get("content"), item["metadata"]))
+        if self._mission_digest(extracted) != digest:
+            raise ValueError("Mission receipt message fingerprint mismatch")
+        return {"status": "PUBLISHED", "mission_id": mission_id,
+                "sha256": digest, "start": start, "count": count}
+
+    def inspect_mission_turn(self, conversation_id: str, *, mission_id: str) -> dict[str, Any]:
+        """Read-only reconciliation evidence. Never use ABSENT to replay Core.
+
+        This verifies only the conversation file. Core/Workspace/Git must be
+        reconciled independently before an operation can be considered safe.
+        """
+        mission_id = self._validate_mission_id(mission_id)
+        with self._lock:
+            record = self.get(conversation_id)
+            return self._mission_receipt_state(record, mission_id)
+
     def append_messages(
         self,
         conversation_id: str,
         *,
         messages: list[dict[str, Any]],
+        mission_id: str | None = None,
     ) -> dict[str, Any]:
         """Validate then publish all messages with exactly one atomic rename.
 
@@ -169,10 +236,31 @@ class ConversationStore:
                 raise ValueError("Conversation metadata must be an object")
             validated.append((item["role"], content, metadata))
 
+        if mission_id is not None:
+            mission_id = self._validate_mission_id(mission_id)
+            for _role, _content, meta in validated:
+                if (isinstance(meta.get("mission"), dict)
+                        and meta["mission"].get("task_id") not in (None, mission_id)):
+                    raise ValueError("Mission identifier mismatches message metadata")
+            incoming_digest = self._mission_digest(validated)
+
         with self._lock:
             record = self.get(conversation_id)
             if not isinstance(record.get("messages"), list):
                 raise ValueError("Invalid conversation messages collection")
+            if mission_id is not None:
+                state = self._mission_receipt_state(record, mission_id)
+                if state["status"] == "PUBLISHED":
+                    if (state["sha256"] != incoming_digest
+                            or state["count"] != len(validated)):
+                        raise ValueError("Conflicting retry for existing mission")
+                    return record  # Durable turn already present: no duplicate write.
+                if state["status"] != "ABSENT":
+                    raise RuntimeError("Legacy mission ambiguous; manual reconciliation required")
+                receipts = record.setdefault("mission_turns", {})
+                receipts[mission_id] = {"start": len(record["messages"]),
+                                        "count": len(validated),
+                                        "sha256": incoming_digest}
             now = _utc_now()
             for role, content, metadata in validated:
                 record["messages"].append({

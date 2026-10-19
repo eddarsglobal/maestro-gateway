@@ -2735,7 +2735,7 @@ class GovernedDirectMissionRunner:
                 # only AFTER Core has returned its durable verdict. A late
                 # cancel after proven Core commit cannot erase that commitment.
                 conversation = self._conversations.append_messages(
-                    conversation["id"], messages=[
+                    conversation["id"], mission_id=str(result["task_id"]), messages=[
                         {"role": "user", "content": prompt},
                         {"role": "assistant", "content": output,
                          "metadata": {"mission": result}},
@@ -2753,7 +2753,7 @@ class GovernedDirectMissionRunner:
                         "metadata": {"mission": result},
                     })
                 conversation = self._conversations.append_messages(
-                    conversation["id"], messages=messages,
+                    conversation["id"], mission_id=str(result["task_id"]), messages=messages,
                 )
                 result["conversation_title"] = conversation["title"]
             # An observed cancellation before the Core verdict publishes no
