@@ -48,6 +48,7 @@ from .git_staging import (
     GitStageStateError,
 )
 from .mission import GovernedDirectMissionRunner
+from .request_journal import RequestReplayBlocked
 from .mission_control import MissionControl, MissionConflictError, MissionCancelledError
 from .software_artifact_verifier import (
     VerifiedSoftwareArtifacts, ArtifactVerificationError,
@@ -2286,7 +2287,33 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 result = None
                 cancellation = None
                 if request_id is not None:
-                    cancellation = self.server.mission_control.register(request_id)
+                    # Stable HTTP identity must reach the durable DIRECT lease.
+                    # MissionControl records the cancellation lifecycle separately.
+                    try:
+                        cancellation = self.server.mission_control.register(request_id)
+                    except MissionConflictError:
+                        # A completed request may be returned only after read-only
+                        # verification of the durable request *and* conversation
+                        # receipts. Never call the ordinary run() path here: if
+                        # the request receipt is missing it could execute Core.
+                        record = self.server.mission_control.status(request_id)
+                        if (record["state"] == "completed"
+                                and payload.get("mode", "M0_DIRECT") == "M0_DIRECT"):
+                            replayed = self.server.mission_runner.replay_completed_only(
+                                request_id=request_id,
+                                prompt=payload.get("prompt"),
+                                model=payload.get("model"),
+                                max_tokens=payload.get("max_tokens", 512),
+                                conversation_id=payload.get("conversation_id"),
+                                workspace_id=payload.get("workspace_id"),
+                                ui_language=payload.get("ui_language"),
+                            )
+                            self._send_json(
+                                HTTPStatus.OK if replayed.get("ok") else HTTPStatus.UNPROCESSABLE_ENTITY,
+                                replayed,
+                            )
+                            return
+                        raise
                 foreground_engaged = False
                 try:
                     if request_id is not None:
@@ -2328,6 +2355,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         ),
                         ui_language=payload.get("ui_language"),
                         cancellation=cancellation,
+                        request_id=(request_id if payload.get("mode", "M0_DIRECT") == "M0_DIRECT"
+                                    else None),
                     )
                     )
                 finally:
@@ -2339,6 +2368,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             cancelled=cancellation.is_set(),
                             durable_committed=bool(result and result.get("tx_committed")),
                         )
+            except RequestReplayBlocked as exc:
+                # A conflict is not proof of a failed or rolled-back Core TX.
+                self._send_json(HTTPStatus.CONFLICT,
+                                {"error": "mission_reconciliation_required", "message": str(exc)})
+                return
             except MissionConflictError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error":"duplicate_mission_request", "message":str(exc)})
                 return

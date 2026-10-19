@@ -1221,6 +1221,36 @@ class GovernedDirectMissionRunner:
                     pass  # The original STARTED_UNCERTAIN receipt remains fail-closed.
                 raise
 
+    def replay_completed_only(
+        self,
+        *,
+        request_id: str,
+        prompt: str,
+        model: str | None = None,
+        max_tokens: int = 512,
+        conversation_id: str | None = None,
+        workspace_id: str | None = None,
+        ui_language: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a previously committed DIRECT result without executing Core.
+
+        This is exclusively for an already-completed MissionControl record.
+        Mismatched input, absent journal/turn, or ambiguous outcomes block.
+        """
+        signature = fingerprint({"mode": "M0_DIRECT", "prompt": prompt, "model": model,
+                                 "max_tokens": max_tokens, "conversation_id": conversation_id,
+                                 "workspace_id": workspace_id, "ui_language": ui_language})
+        journal = MissionRequestJournal(self._conversations.root)
+        previous = journal.read_completed_only(request_id, signature)
+        try:
+            receipt = self._conversations.inspect_mission_turn(
+                previous["conversation_id"], mission_id=previous["task_id"])
+        except (ValueError, KeyError, OSError) as exc:
+            raise RequestReplayBlocked("Conversation receipt missing/corrupt; no replay") from exc
+        if receipt["status"] != "PUBLISHED":
+            raise RequestReplayBlocked("Conversation turn not verified; no replay")
+        return previous
+
     def _run_untracked(
         self,
         *,

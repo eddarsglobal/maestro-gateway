@@ -299,3 +299,27 @@ class MissionRequestJournal:
         return {'state': state['state'], 'updated_at': state['updated_at'],
                 'task_id': state.get('result', {}).get('task_id'),
                 'conversation_id': state.get('result', {}).get('conversation_id')}
+
+    def read_completed_only(self, request_id: str, request_fingerprint: str) -> dict[str, Any]:
+        """Read-only verified replay: never creates a lock or a STARTED receipt.
+
+        In particular, a completed cancellation record without the matching
+        journal entry is NOT permission to execute Core again.
+        """
+        name = self._request_hash(request_id)
+        if not isinstance(request_fingerprint, str) or not re.fullmatch('[a-f0-9]{64}', request_fingerprint):
+            raise ValueError('Invalid request fingerprint')
+        _verify_root(self.root)
+        lock_path = self.root / (name + '.lock')
+        if lock_path.is_symlink() or not lock_path.is_file():
+            raise RequestReplayBlocked('Durable request lock tombstone missing/unsafe')
+        try:
+            record = json.loads(_no_follow_read(self.root / (name + '.json')))
+        except FileNotFoundError as exc:
+            raise RequestReplayBlocked('Completed request receipt missing; no Core replay') from exc
+        except (ValueError, UnicodeError, RuntimeError, OSError) as exc:
+            raise RequestReplayBlocked('Invalid or unsafe completed request receipt') from exc
+        state = _check_record(record, name, request_fingerprint)
+        if state['state'] != 'COMPLETED':
+            raise RequestReplayBlocked('Prior request outcome uncertain; no Core replay')
+        return dict(state['result'])
