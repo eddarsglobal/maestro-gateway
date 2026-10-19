@@ -41,6 +41,7 @@ from .response_effort import (bounded_response_tokens, local_execution_profile,
                               direct_fast_lane_eligible, direct_fast_instruction,
                               stream_completion_policy)
 from .conversations import ConversationStore
+from .request_journal import MissionRequestJournal, RequestReplayBlocked, fingerprint
 from .core import MaestroCoreBridge
 from .response_guard import (QualityResult, evaluate_response, asks_about_capabilities,
                              asks_about_previous_language)
@@ -1153,6 +1154,74 @@ class GovernedDirectMissionRunner:
             }
 
     def run(
+        self,
+        *,
+        prompt: str,
+        model: str | None = None,
+        max_tokens: int = 512,
+        conversation_id: str | None = None,
+        workspace_id: str | None = None,
+        mode: str = "M0_DIRECT",
+        research_url: str | None = None,
+        ui_language: str | None = None,
+        cancellation: Any = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Optional durable replay boundary for DIRECT requests only.
+
+        HTTP ingress must pass a genuine stable caller request_id. Without it
+        the legacy execution path is unchanged and NOT replay-certified.
+        A pending/uncertain request is NEVER automatically executed again.
+        """
+        kwargs = dict(prompt=prompt, model=model, max_tokens=max_tokens,
+                      conversation_id=conversation_id, workspace_id=workspace_id,
+                      mode=mode, research_url=research_url,
+                      ui_language=ui_language, cancellation=cancellation)
+        if request_id is None:
+            return self._run_untracked(**kwargs)
+        if not isinstance(mode, str) or mode.strip().upper() != "M0_DIRECT":
+            raise ValueError("Durable request journal supports DIRECT mode only")
+        signature = fingerprint({"mode": "M0_DIRECT", "prompt": prompt, "model": model,
+                                 "max_tokens": max_tokens, "conversation_id": conversation_id,
+                                 "workspace_id": workspace_id, "ui_language": ui_language})
+        journal = MissionRequestJournal(self._conversations.root)
+        with journal.open(request_id, signature) as lease:
+            existing = lease.existing
+            if existing is not None:
+                if existing["state"] != "COMPLETED":
+                    raise RequestReplayBlocked("Prior request outcome uncertain; no automatic Core replay")
+                previous = existing["result"]
+                try:
+                    receipt = self._conversations.inspect_mission_turn(
+                        previous["conversation_id"], mission_id=previous["task_id"])
+                except (ValueError, KeyError, OSError) as exc:
+                    raise RequestReplayBlocked("Conversation receipt missing/corrupt; no replay") from exc
+                if receipt["status"] != "PUBLISHED":
+                    raise RequestReplayBlocked("Conversation turn not verified; no replay")
+                return dict(previous)  # No Core/Workspace/Git execution.
+            try:
+                result = self._run_untracked(**kwargs)
+                if not isinstance(result, dict):
+                    raise RequestReplayBlocked("Core returned a non-object outcome")
+                task_id = result.get("task_id")
+                cid = result.get("conversation_id")
+                if not isinstance(task_id, str) or not isinstance(cid, str):
+                    raise RequestReplayBlocked("No durable Core mission/conversation identity")
+                receipt = self._conversations.inspect_mission_turn(cid, mission_id=task_id)
+                if receipt["status"] != "PUBLISHED":
+                    lease.uncertain("CONVERSATION_NOT_PUBLISHED")
+                    return result  # Return real result, but replay is blocked.
+                lease.complete(result)
+                return result
+            except Exception as exc:
+                # Core may already have committed; do not infer rollback.
+                try:
+                    lease.uncertain(type(exc).__name__)
+                except Exception:
+                    pass  # The original STARTED_UNCERTAIN receipt remains fail-closed.
+                raise
+
+    def _run_untracked(
         self,
         *,
         prompt: str,

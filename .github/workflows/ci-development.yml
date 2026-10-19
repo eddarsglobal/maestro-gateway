@@ -56,7 +56,7 @@ jobs:
               python -m pip install -e "./$REPO"
             fi
           done
-      - name: Run complete Gateway unittest suite; require 436+
+      - name: Run complete Gateway unittest suite; require 461+
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/maestro/src:${{ github.workspace }}/maestro-gateway/src
@@ -74,6 +74,6 @@ jobs:
           import pathlib, re, sys
           content = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
           found = re.findall(r'Ran (\d+) tests? in ', content)
-          assert found and int(found[-1]) >= 436, f'Gateway coverage too low or missing summary: {found!r}'
+          assert found and int(found[-1]) >= 461, f'Gateway coverage too low or missing summary: {found!r}'
           print(f'GATEWAY FULL REGRESSION PASS: {found[-1]} tests')
           PY
