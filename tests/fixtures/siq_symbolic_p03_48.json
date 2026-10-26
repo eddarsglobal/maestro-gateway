@@ -1,0 +1,338 @@
+[
+  {
+    "id": "en-21-logic",
+    "language": "en",
+    "kind": "logic",
+    "prompt": "A arrives before B, B before C, C before D, and D before E. Which is last? Reply with just the letter.",
+    "expected": "E"
+  },
+  {
+    "id": "en-22-set",
+    "language": "en",
+    "kind": "set",
+    "prompt": "Set X = {RAVEN, ORCHID, PEAR}; set Y = {ORCHID, PEAR, MAPLE}; set Z = {PEAR, MAPLE, ASH}. Which word is in all three sets? Return that word only.",
+    "expected": "PEAR"
+  },
+  {
+    "id": "en-23-rule",
+    "language": "en",
+    "kind": "rule",
+    "prompt": "Apply this exact rule: if integer 45 is divisible by 3 AND is odd, reply ALPHA; otherwise reply BETA. One word only.",
+    "expected": "ALPHA"
+  },
+  {
+    "id": "en-24-rule",
+    "language": "en",
+    "kind": "rule",
+    "prompt": "Apply this exact rule: if integer 44 is divisible by 3 AND is odd, reply ALPHA; otherwise reply BETA. One word only.",
+    "expected": "BETA"
+  },
+  {
+    "id": "en-25-time",
+    "language": "en",
+    "kind": "time",
+    "prompt": "A meeting begins at 09:10. The first step takes 35 minutes and the second takes 50 more minutes. Give the ending time in HH:MM only.",
+    "expected": "10:35"
+  },
+  {
+    "id": "en-26-reverse",
+    "language": "en",
+    "kind": "reverse",
+    "prompt": "Reverse ABCD, then return only the third character of the reversed string.",
+    "expected": "B"
+  },
+  {
+    "id": "fr-21-logic",
+    "language": "fr",
+    "kind": "logic",
+    "prompt": "A arrive avant B, B avant C, C avant D et D avant E. Qui arrive en dernier ? Réponds uniquement par la lettre.",
+    "expected": "E"
+  },
+  {
+    "id": "fr-22-set",
+    "language": "fr",
+    "kind": "set",
+    "prompt": "Ensemble X = {RAVEN, ORCHID, PEAR}, Y = {ORCHID, PEAR, MAPLE}, Z = {PEAR, MAPLE, ASH}. Quel mot appartient aux trois ensembles ? Donne uniquement ce mot.",
+    "expected": "PEAR"
+  },
+  {
+    "id": "fr-23-rule",
+    "language": "fr",
+    "kind": "rule",
+    "prompt": "Applique cette règle : si 45 est divisible par 3 ET impair, réponds ALPHA ; sinon réponds BETA. Un seul mot.",
+    "expected": "ALPHA"
+  },
+  {
+    "id": "fr-24-rule",
+    "language": "fr",
+    "kind": "rule",
+    "prompt": "Applique cette règle : si 44 est divisible par 3 ET impair, réponds ALPHA ; sinon réponds BETA. Un seul mot.",
+    "expected": "BETA"
+  },
+  {
+    "id": "fr-25-time",
+    "language": "fr",
+    "kind": "time",
+    "prompt": "Une réunion commence à 09:10. La première étape dure 35 minutes puis la deuxième 50 minutes. Donne uniquement la fin au format HH:MM.",
+    "expected": "10:35"
+  },
+  {
+    "id": "fr-26-reverse",
+    "language": "fr",
+    "kind": "reverse",
+    "prompt": "Inverse la chaîne ABCD puis retourne uniquement son troisième caractère.",
+    "expected": "B"
+  },
+  {
+    "id": "de-21-logic",
+    "language": "de",
+    "kind": "logic",
+    "prompt": "A kommt vor B, B vor C, C vor D und D vor E an. Wer kommt zuletzt? Antworte nur mit dem Buchstaben.",
+    "expected": "E"
+  },
+  {
+    "id": "de-22-set",
+    "language": "de",
+    "kind": "set",
+    "prompt": "Menge X = {RAVEN, ORCHID, PEAR}, Y = {ORCHID, PEAR, MAPLE}, Z = {PEAR, MAPLE, ASH}. Welches Wort gehört zu allen drei Mengen? Nur das Wort.",
+    "expected": "PEAR"
+  },
+  {
+    "id": "de-23-rule",
+    "language": "de",
+    "kind": "rule",
+    "prompt": "Wende diese Regel an: Falls 45 durch 3 teilbar UND ungerade ist, antworte ALPHA, sonst BETA. Nur ein Wort.",
+    "expected": "ALPHA"
+  },
+  {
+    "id": "de-24-rule",
+    "language": "de",
+    "kind": "rule",
+    "prompt": "Wende diese Regel an: Falls 44 durch 3 teilbar UND ungerade ist, antworte ALPHA, sonst BETA. Nur ein Wort.",
+    "expected": "BETA"
+  },
+  {
+    "id": "de-25-time",
+    "language": "de",
+    "kind": "time",
+    "prompt": "Ein Treffen beginnt um 09:10. Der erste Schritt dauert 35 Minuten, der zweite weitere 50 Minuten. Antworte nur mit der Endzeit HH:MM.",
+    "expected": "10:35"
+  },
+  {
+    "id": "de-26-reverse",
+    "language": "de",
+    "kind": "reverse",
+    "prompt": "Kehre ABCD um und gib nur das dritte Zeichen der umgekehrten Zeichenfolge zurück.",
+    "expected": "B"
+  },
+  {
+    "id": "ar-21-logic",
+    "language": "ar",
+    "kind": "logic",
+    "prompt": "يصل A قبل B، ويصل B قبل C، ويصل C قبل D، ويصل D قبل E. من يصل أخيرًا؟ أجب بالحرف فقط.",
+    "expected": "E"
+  },
+  {
+    "id": "ar-22-set",
+    "language": "ar",
+    "kind": "set",
+    "prompt": "المجموعة X = {RAVEN, ORCHID, PEAR} والمجموعة Y = {ORCHID, PEAR, MAPLE} والمجموعة Z = {PEAR, MAPLE, ASH}. ما الكلمة المشتركة بين المجموعات الثلاث؟ أجب بالكلمة وحدها.",
+    "expected": "PEAR"
+  },
+  {
+    "id": "ar-23-rule",
+    "language": "ar",
+    "kind": "rule",
+    "prompt": "طبّق هذه القاعدة: إذا كان 45 يقبل القسمة على 3 وكان فرديًا فأجب ALPHA، وإلا فأجب BETA. كلمة واحدة فقط.",
+    "expected": "ALPHA"
+  },
+  {
+    "id": "ar-24-rule",
+    "language": "ar",
+    "kind": "rule",
+    "prompt": "طبّق هذه القاعدة: إذا كان 44 يقبل القسمة على 3 وكان فرديًا فأجب ALPHA، وإلا فأجب BETA. كلمة واحدة فقط.",
+    "expected": "BETA"
+  },
+  {
+    "id": "ar-25-time",
+    "language": "ar",
+    "kind": "time",
+    "prompt": "يبدأ الاجتماع الساعة 09:10. تستغرق المرحلة الأولى 35 دقيقة والثانية 50 دقيقة إضافية. أجب بوقت النهاية بصيغة HH:MM فقط.",
+    "expected": "10:35"
+  },
+  {
+    "id": "ar-26-reverse",
+    "language": "ar",
+    "kind": "reverse",
+    "prompt": "اعكس السلسلة ABCD ثم أجب بالحرف الثالث من السلسلة المعكوسة فقط.",
+    "expected": "B"
+  },
+  {
+    "id": "pt-21-logic",
+    "language": "pt",
+    "kind": "logic",
+    "prompt": "A chega antes de B, B antes de C, C antes de D e D antes de E. Quem chega por último? Responde apenas com a letra.",
+    "expected": "E"
+  },
+  {
+    "id": "pt-22-set",
+    "language": "pt",
+    "kind": "set",
+    "prompt": "Conjunto X = {RAVEN, ORCHID, PEAR}, Y = {ORCHID, PEAR, MAPLE}, Z = {PEAR, MAPLE, ASH}. Que palavra pertence aos três conjuntos? Responde só com a palavra.",
+    "expected": "PEAR"
+  },
+  {
+    "id": "pt-23-rule",
+    "language": "pt",
+    "kind": "rule",
+    "prompt": "Aplica esta regra: se 45 é divisível por 3 E ímpar, responde ALPHA; caso contrário BETA. Apenas uma palavra.",
+    "expected": "ALPHA"
+  },
+  {
+    "id": "pt-24-rule",
+    "language": "pt",
+    "kind": "rule",
+    "prompt": "Aplica esta regra: se 44 é divisível por 3 E ímpar, responde ALPHA; caso contrário BETA. Apenas uma palavra.",
+    "expected": "BETA"
+  },
+  {
+    "id": "pt-25-time",
+    "language": "pt",
+    "kind": "time",
+    "prompt": "Uma reunião começa às 09:10. A primeira fase demora 35 minutos e a segunda mais 50 minutos. Responde apenas com a hora final HH:MM.",
+    "expected": "10:35"
+  },
+  {
+    "id": "pt-26-reverse",
+    "language": "pt",
+    "kind": "reverse",
+    "prompt": "Inverte ABCD e devolve apenas o terceiro caráter da cadeia invertida.",
+    "expected": "B"
+  },
+  {
+    "id": "es-21-logic",
+    "language": "es",
+    "kind": "logic",
+    "prompt": "A llega antes que B, B antes que C, C antes que D y D antes que E. ¿Quién llega al final? Responde solo con la letra.",
+    "expected": "E"
+  },
+  {
+    "id": "es-22-set",
+    "language": "es",
+    "kind": "set",
+    "prompt": "Conjunto X = {RAVEN, ORCHID, PEAR}, Y = {ORCHID, PEAR, MAPLE}, Z = {PEAR, MAPLE, ASH}. ¿Qué palabra pertenece a los tres conjuntos? Devuelve solo esa palabra.",
+    "expected": "PEAR"
+  },
+  {
+    "id": "es-23-rule",
+    "language": "es",
+    "kind": "rule",
+    "prompt": "Aplica esta regla: si 45 es divisible por 3 Y es impar, responde ALPHA; de lo contrario BETA. Solo una palabra.",
+    "expected": "ALPHA"
+  },
+  {
+    "id": "es-24-rule",
+    "language": "es",
+    "kind": "rule",
+    "prompt": "Aplica esta regla: si 44 es divisible por 3 Y es impar, responde ALPHA; de lo contrario BETA. Solo una palabra.",
+    "expected": "BETA"
+  },
+  {
+    "id": "es-25-time",
+    "language": "es",
+    "kind": "time",
+    "prompt": "Una reunión empieza a las 09:10. La primera etapa dura 35 minutos y la segunda otros 50. Responde solo con la hora final HH:MM.",
+    "expected": "10:35"
+  },
+  {
+    "id": "es-26-reverse",
+    "language": "es",
+    "kind": "reverse",
+    "prompt": "Invierte ABCD y devuelve únicamente el tercer carácter de la cadena invertida.",
+    "expected": "B"
+  },
+  {
+    "id": "hr-21-logic",
+    "language": "hr",
+    "kind": "logic",
+    "prompt": "A stiže prije B, B prije C, C prije D, a D prije E. Tko stiže posljednji? Odgovori samo slovom.",
+    "expected": "E"
+  },
+  {
+    "id": "hr-22-set",
+    "language": "hr",
+    "kind": "set",
+    "prompt": "Skup X = {RAVEN, ORCHID, PEAR}, Y = {ORCHID, PEAR, MAPLE}, Z = {PEAR, MAPLE, ASH}. Koja je riječ u sva tri skupa? Odgovori samo riječju.",
+    "expected": "PEAR"
+  },
+  {
+    "id": "hr-23-rule",
+    "language": "hr",
+    "kind": "rule",
+    "prompt": "Primijeni pravilo: ako je 45 djeljiv s 3 I neparan, odgovori ALPHA; inače BETA. Samo jedna riječ.",
+    "expected": "ALPHA"
+  },
+  {
+    "id": "hr-24-rule",
+    "language": "hr",
+    "kind": "rule",
+    "prompt": "Primijeni pravilo: ako je 44 djeljiv s 3 I neparan, odgovori ALPHA; inače BETA. Samo jedna riječ.",
+    "expected": "BETA"
+  },
+  {
+    "id": "hr-25-time",
+    "language": "hr",
+    "kind": "time",
+    "prompt": "Sastanak počinje u 09:10. Prvi dio traje 35 minuta, a drugi još 50 minuta. Odgovori samo vremenom završetka HH:MM.",
+    "expected": "10:35"
+  },
+  {
+    "id": "hr-26-reverse",
+    "language": "hr",
+    "kind": "reverse",
+    "prompt": "Obrni niz ABCD i vrati samo treći znak obrnutog niza.",
+    "expected": "B"
+  },
+  {
+    "id": "it-21-logic",
+    "language": "it",
+    "kind": "logic",
+    "prompt": "A arriva prima di B, B prima di C, C prima di D e D prima di E. Chi arriva per ultimo? Rispondi solo con la lettera.",
+    "expected": "E"
+  },
+  {
+    "id": "it-22-set",
+    "language": "it",
+    "kind": "set",
+    "prompt": "Insieme X = {RAVEN, ORCHID, PEAR}, Y = {ORCHID, PEAR, MAPLE}, Z = {PEAR, MAPLE, ASH}. Quale parola appartiene a tutti e tre? Restituisci solo la parola.",
+    "expected": "PEAR"
+  },
+  {
+    "id": "it-23-rule",
+    "language": "it",
+    "kind": "rule",
+    "prompt": "Applica questa regola: se 45 è divisibile per 3 ED è dispari, rispondi ALPHA; altrimenti BETA. Una sola parola.",
+    "expected": "ALPHA"
+  },
+  {
+    "id": "it-24-rule",
+    "language": "it",
+    "kind": "rule",
+    "prompt": "Applica questa regola: se 44 è divisibile per 3 ED è dispari, rispondi ALPHA; altrimenti BETA. Una sola parola.",
+    "expected": "BETA"
+  },
+  {
+    "id": "it-25-time",
+    "language": "it",
+    "kind": "time",
+    "prompt": "Una riunione inizia alle 09:10. La prima fase dura 35 minuti e la seconda altri 50 minuti. Rispondi solo con l’orario finale HH:MM.",
+    "expected": "10:35"
+  },
+  {
+    "id": "it-26-reverse",
+    "language": "it",
+    "kind": "reverse",
+    "prompt": "Inverti ABCD e restituisci soltanto il terzo carattere della stringa invertita.",
+    "expected": "B"
+  }
+]

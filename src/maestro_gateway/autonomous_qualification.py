@@ -292,13 +292,15 @@ class AutonomousQualificationService:
     def __init__(self, *, candidate_supplier: Callable[[], list[tuple[Any, str]]],
                  runner: Callable[[Any, str, threading.Event, float], tuple[str, str | None]],
                  state_path: Path, idle_seconds: float = 90.0,
-                 probe_timeout: float = 25.0, enabled: bool = True):
+                 probe_timeout: float = 25.0, enabled: bool = True,
+                 admission: Any = None):
         self.candidate_supplier = candidate_supplier
         self.runner = runner
         self.state_path = state_path
         self.idle_seconds = max(1.0, idle_seconds)
         self.probe_timeout = min(40.0, max(2.0, probe_timeout))
         self.enabled = enabled
+        self._admission = admission
         self._lock = threading.Lock()
         self._last_user_activity = time.monotonic()
         self._active_users = 0
@@ -379,10 +381,13 @@ class AutonomousQualificationService:
                 'local_probe_entries': observed, 'last_result': result,
                 'supported_languages': list(LANGUAGES), 'english_default': True,
                 'semantic_quality_certified': False,
-                'probe_scope': 'synthetic arithmetic/translation/reasoning/permission, not general intelligence'}
+                'probe_scope': 'synthetic arithmetic/translation/reasoning/permission, not general intelligence',
+                'native_idle_admission': 'BLOCKED_UNVERIFIED_PROVIDER' if self._admission is None or not self._admission.idle_authorized else 'SIMULATION_OR_VERIFIED_ONLY'}
 
     def run_one_if_idle(self) -> bool:
-        if not self.enabled or not self.idle() or self._stop.is_set():
+        if (not self.enabled or self._admission is None
+                or not self._admission.idle_authorized
+                or not self.idle() or self._stop.is_set()):
             return False
         day = time.strftime('%Y-%m-%d', time.localtime())
         if day != self._daily_day:
@@ -469,6 +474,9 @@ class AutonomousQualificationService:
         with self._lock:
             if self._active_users:
                 return False
+            idle_token = self._admission.begin_idle(cancel)
+            if idle_token is None:
+                return False
             self._cancel = cancel
             self._running = True
         started = time.monotonic()
@@ -508,6 +516,8 @@ class AutonomousQualificationService:
             wall = (time.monotonic() - started) * 1000
             with self._lock:
                 self._running = False
+                # The lease covers the entire inference call, not just dispatch.
+                self._admission.end_idle(idle_token)
                 self._attempts += 1
                 self._daily_count += 1
                 self._last_result = outcome

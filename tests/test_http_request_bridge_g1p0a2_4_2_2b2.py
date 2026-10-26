@@ -23,6 +23,7 @@ from maestro_gateway.mission import GovernedDirectMissionRunner
 from maestro_gateway.mission_control import MissionControl
 from maestro_gateway.request_journal import MissionRequestJournal
 from maestro_gateway.server import GatewayHandler
+from maestro_gateway.native_admission import NativeAdmissionBarrier
 
 
 class FakeQualification:
@@ -77,6 +78,9 @@ class HTTPBridgeTests(unittest.TestCase):
         self.server.mission_runner = self.runner
         self.server.mission_control = self.control
         self.server.autonomous_qualification = FakeQualification()
+        # Explicit native foreground admission is part of the real server API.
+        # Do not bypass it when exercising request idempotency and crash safety.
+        self.server.model_admission = NativeAdmissionBarrier(adapter_cancellation_verified=False)
         self.t = threading.Thread(target=self.server.serve_forever,
                                   kwargs={'poll_interval': 0.01}, daemon=True)
         self.t.start()
@@ -99,6 +103,26 @@ class HTTPBridgeTests(unittest.TestCase):
             return response.status, json.loads(response.read())
         finally:
             connection.close()
+
+    def test_missing_admission_fails_closed_before_receipt(self):
+        barrier = self.server.model_admission
+        del self.server.model_admission
+        try:
+            status, body = self.post({'prompt': 'hello', 'request_id': self.request_id})
+            self.assertEqual(status, 503, body)
+            self.assertEqual(body['error'], 'native_model_admission_unavailable')
+            self.assertEqual(self.runner.calls, 0)
+            with self.assertRaises(KeyError):
+                self.control.status(self.request_id)
+        finally:
+            self.server.model_admission = barrier
+
+    def test_shut_down_admission_denies_core_execution(self):
+        self.server.model_admission.shutdown()
+        status, body = self.post({'prompt': 'hello'})
+        self.assertEqual(status, 503, body)
+        self.assertEqual(body['error'], 'native_model_admission_busy')
+        self.assertEqual(self.runner.calls, 0)
 
     def test_http_direct_passes_same_id_and_commits_both_ledgers(self):
         status, result = self.post({'prompt': 'hello', 'request_id': self.request_id})
@@ -195,6 +219,7 @@ from pathlib import Path
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from maestro_gateway.server import GatewayHandler
+from maestro_gateway.native_admission import NativeAdmissionBarrier
 from maestro_gateway.conversations import ConversationStore
 from maestro_gateway.mission_control import MissionControl
 from maestro_gateway.mission import GovernedDirectMissionRunner
@@ -210,6 +235,7 @@ s.config=SimpleNamespace(allowed_origins=())
 s.mission_control=MissionControl(root/'mission-controls')
 s.mission_runner=DeadCore(ConversationStore(root/'conversations'))
 s.autonomous_qualification=Qual()
+s.model_admission=NativeAdmissionBarrier(adapter_cancellation_verified=False)
 print(s.server_address[1],flush=True)
 s.serve_forever(poll_interval=0.01)
 '''

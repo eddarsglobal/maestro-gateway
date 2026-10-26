@@ -27,12 +27,12 @@ from .primary_intelligence import PrimarySelection
 from .capabilities import CapabilityRegistry
 from .adaptive_router import (choose_adaptive_resource, choose_quality_fallback,
                               choose_timeout_fallback, _language_code, classify_request,
-                              response_language_hint)
+                              response_language_hint, explicit_requested_language)
 from .model_qualification import observe_attempt
 from .semantic_competence import observe_semantic_attempt
 from .semantic_verifier import (
     deterministic_expectation, deterministic_truth_projection,
-    verify_deterministic_response,
+    verify_deterministic_response, strict_multilingual_arithmetic,
 )
 from .response_effort import (bounded_response_tokens, local_execution_profile,
                              reconcile_bounded_structure_budget,
@@ -42,10 +42,30 @@ from .response_effort import (bounded_response_tokens, local_execution_profile,
                               stream_completion_policy)
 from .conversations import ConversationStore
 from .request_journal import MissionRequestJournal, RequestReplayBlocked, fingerprint
+from .effect_journal import EffectJournal, effect_scope, current_effect_journal
 from .core import MaestroCoreBridge
 from .response_guard import (QualityResult, evaluate_response, asks_about_capabilities,
                              asks_about_previous_language)
 from .workspace import WorkspaceRegistry
+from .conversation_language_context import (resolve_previous_language_answer,
+                                           is_previous_language_question)
+from .native_linguistic_revision import (
+    foreign_alpha_tokens_except_maestro,
+    fact_grounded_identity_instruction,
+    linguistic_revision_requested,
+    maestro_identity_contradicted,
+    maestro_identity_grounded,
+    maestro_identity_grounding_required,
+    native_revision_instruction,
+    native_revision_retry_instruction,
+    normalized_language,
+    repairable_linguistic_draft,
+    structured_identity_slot_count,
+    structured_identity_slot_instruction,
+    structured_identity_slot_retry_instruction,
+    validate_structured_identity_slot,
+    compose_structured_identity_slots,
+)
 
 
 def _semantic_recovery_attempt_count(selection: PrimarySelection | None) -> int:
@@ -95,17 +115,28 @@ def _deterministic_core_preflight(
             prompt, task, workspace_active=workspace_active
         )
     )
-    # FIXED3: an exact, independently proven extraction is Core eligible in AUTO.
-    # The default fast-lane classifier may miss negations and ordinal variants.
-    # Never override a user-selected model, workspace policy or prior-turn intent.
+    # FIX8: preserve independently proven atomic Core work even when generic
+    # request classification is conservative.  Extraction was already allowed;
+    # exact_echo now receives the same treatment so a prompt such as
+    # "Retiens ... / Réponds uniquement OK." does not invoke a model merely
+    # because the surrounding content contains a word such as "code".
+    # Capability questions, Workspace authority and explicit model overrides
+    # remain outside this lane.
     if (
         not fast_lane
         and not workspace_active
         and not str(model or "").strip()
         and not asks_about_previous_language(prompt)
+        and not asks_about_capabilities(prompt)
     ):
-        extraction_proof = deterministic_expectation(prompt)
-        if extraction_proof is not None and extraction_proof.subtask == "extraction":
+        atomic_proof = deterministic_expectation(prompt)
+        if (atomic_proof is not None
+                and ((atomic_proof.subtask in {"extraction", "exact_echo"} or atomic_proof.subtask in {"symbolic_order", "symbolic_intersection", "symbolic_rule", "symbolic_clock", "symbolic_reverse_index"})
+                     or (atomic_proof.subtask == "arithmetic"
+                         and strict_multilingual_arithmetic(prompt) is not None))):
+            # Give only a bounded, single-purpose, locally-proven arithmetic
+            # task the fast lane; the legacy broad recognizer alone is not an
+            # authorization to skip ordinary mission routing.
             fast_lane = True
     contract = deterministic_expectation(prompt) if fast_lane else None
     subtask = contract.subtask if contract is not None else None
@@ -142,6 +173,31 @@ _TOOL_PATTERN = re.compile(
 
 MAX_TOOL_ROUNDS = 5
 MAX_QUALITY_RETRIES = 1
+
+
+def _benchmark_contract_retry_stays_on_resource(
+    primary_selection: PrimarySelection | None, prompt: str, quality_reason: str
+) -> bool:
+    """Keep a digest-bound language winner for one bounded format retry.
+
+    A shape miss is not evidence that the model lacks language competence.  When
+    the current resource was selected from explicit, digest-bound user benchmark
+    evidence, an explicit-language format failure gets its existing single retry
+    on that same resource.  Semantic/transport failures remain eligible for the
+    normal failover policy.  This function grants no extra retry budget.
+    """
+    return bool(
+        primary_selection is not None
+        and primary_selection.reason == "user_language_benchmark_evidence"
+        and explicit_requested_language(prompt) is not None
+        and (str(quality_reason).startswith("explicit_shape_")
+             or quality_reason in {
+                 "user_instruction_echo",
+                 "direct_answer_meta_preamble",
+                 "direct_answer_question_restatement",
+                 "maestro_identity_not_grounded",
+             })
+    )
 
 
 # A general "who are you / what can you do" requires evidence, but not a
@@ -714,6 +770,12 @@ class GovernedDirectMissionRunner:
                 ),
             )
 
+            # Link the HTTP idempotency identity to the real Core task before
+            # any tracked Core/Workspace effect. No identity is fabricated.
+            effect_journal = current_effect_journal()
+            if effect_journal is not None:
+                effect_journal.bind_task(str(mission.task_id))
+
             mission.acceptance_criteria = [
                 (
                     "AC-01: RX performs one "
@@ -1035,9 +1097,18 @@ class GovernedDirectMissionRunner:
                     mission
                 )
 
+                effect_journal = current_effect_journal()
+                core_effect = None
+                if effect_journal is not None:
+                    core_effect = effect_journal.prepare(
+                        "CORE", "commit_durable_state",
+                        {"task_id": str(mission.task_id)})
+                    effect_journal.engage(core_effect)
                 kernel.commit_durable_state(
                     mission
                 )
+                if core_effect is not None:
+                    effect_journal.observe(core_effect, {"returned": True})
 
                 kernel.close(
                     mission,
@@ -1173,6 +1244,9 @@ class GovernedDirectMissionRunner:
         the legacy execution path is unchanged and NOT replay-certified.
         A pending/uncertain request is NEVER automatically executed again.
         """
+        # Local import keeps the long-standing AST-isolated runner test contract.
+        # It also isolates the new ledger to opted-in DIRECT requests.
+        from maestro_gateway.effect_journal import EffectJournal, effect_scope
         kwargs = dict(prompt=prompt, model=model, max_tokens=max_tokens,
                       conversation_id=conversation_id, workspace_id=workspace_id,
                       mode=mode, research_url=research_url,
@@ -1198,9 +1272,15 @@ class GovernedDirectMissionRunner:
                     raise RequestReplayBlocked("Conversation receipt missing/corrupt; no replay") from exc
                 if receipt["status"] != "PUBLISHED":
                     raise RequestReplayBlocked("Conversation turn not verified; no replay")
+                if existing.get("effects_sha256"):
+                    EffectJournal(self._conversations.root, request_id, signature).verify_returned(
+                        existing["effects_sha256"], previous["task_id"])
                 return dict(previous)  # No Core/Workspace/Git execution.
+            effects = EffectJournal(self._conversations.root, request_id, signature)
+            effects.start()  # same RequestLease owns all effect-journal writes
             try:
-                result = self._run_untracked(**kwargs)
+                with effect_scope(effects):
+                    result = self._run_untracked(**kwargs)
                 if not isinstance(result, dict):
                     raise RequestReplayBlocked("Core returned a non-object outcome")
                 task_id = result.get("task_id")
@@ -1211,7 +1291,10 @@ class GovernedDirectMissionRunner:
                 if receipt["status"] != "PUBLISHED":
                     lease.uncertain("CONVERSATION_NOT_PUBLISHED")
                     return result  # Return real result, but replay is blocked.
-                lease.complete(result)
+                # The effect ledger cannot independently prove remote side effects.
+                # It proves only that all local calls returned before the Core result.
+                effect_proof = effects.returned(task_id)
+                lease.complete(result, effects_sha256=effect_proof)
                 return result
             except Exception as exc:
                 # Core may already have committed; do not infer rollback.
@@ -1241,7 +1324,8 @@ class GovernedDirectMissionRunner:
                                  "max_tokens": max_tokens, "conversation_id": conversation_id,
                                  "workspace_id": workspace_id, "ui_language": ui_language})
         journal = MissionRequestJournal(self._conversations.root)
-        previous = journal.read_completed_only(request_id, signature)
+        completed_record = journal.read_completed_record_only(request_id, signature)
+        previous = completed_record["result"]
         try:
             receipt = self._conversations.inspect_mission_turn(
                 previous["conversation_id"], mission_id=previous["task_id"])
@@ -1249,6 +1333,9 @@ class GovernedDirectMissionRunner:
             raise RequestReplayBlocked("Conversation receipt missing/corrupt; no replay") from exc
         if receipt["status"] != "PUBLISHED":
             raise RequestReplayBlocked("Conversation turn not verified; no replay")
+        if completed_record.get("effects_sha256"):
+            EffectJournal(self._conversations.root, request_id, signature).verify_returned(
+                completed_record["effects_sha256"], previous["task_id"])
         return previous
 
     def _run_untracked(
@@ -1341,6 +1428,18 @@ class GovernedDirectMissionRunner:
             context = _conversation_context(
                 previous_messages
             )
+            previous_language_question = (
+                asks_about_previous_language(prompt)
+                or is_previous_language_question(prompt)
+            )
+            previous_language_core_candidate = None
+            if previous_language_question:
+                previous_language_core_candidate = resolve_previous_language_answer(
+                    prompt,
+                    previous_messages,
+                    _language_code(prompt, ui_language),
+                    explicit_requested_language,
+                )
 
             # Keep the current user input in the mission's in-memory prompt.
             # Publishing it here would leak a half-finished turn if cancelled
@@ -1382,7 +1481,10 @@ class GovernedDirectMissionRunner:
                 ui_language=ui_language,
                 model=model,
             )
-            deterministic_without_model = preflight_core_candidate is not None
+            deterministic_without_model = (
+                preflight_core_candidate is not None
+                or previous_language_core_candidate is not None
+            )
 
             # Open-ended/generative work still fails closed when no inference
             # resource exists.  We never fabricate language-model capability.
@@ -1430,25 +1532,38 @@ class GovernedDirectMissionRunner:
                     prompt, route_task, workspace_active=bool(active_workspace)
                 )
             )
-            # FIXED3: keep the previously established proof after route classification.
-            # This cannot authorize an unproved extraction or a model override.
+            if previous_language_core_candidate is not None:
+                # FIX6: questions about the immediately preceding requested/used
+                # language are locally provable from the persisted transcript.
+                # Do not invoke an LLM or allow unrelated history to distort them.
+                direct_fast_lane = True
+
+            # SIQ-ROOT-P0.2: preserve a locally proven atomic Core result
+            # through both preflight AND post-selection route classification.
+            # This covers extraction, exact_echo and strictly scoped arithmetic;
+            # still cannot authorize Workspace execution, a model override, a
+            # capability claim or a previous-language request.
             if (
                 not direct_fast_lane
                 and deterministic_contract is not None
-                and deterministic_contract.subtask == "extraction"
+                and ((deterministic_contract.subtask in {"extraction", "exact_echo"} or deterministic_contract.subtask in {"symbolic_order", "symbolic_intersection", "symbolic_rule", "symbolic_clock", "symbolic_reverse_index"})
+                     or (deterministic_contract.subtask == "arithmetic"
+                         and strict_multilingual_arithmetic(prompt) is not None))
                 and preflight_core_candidate is not None
                 and not bool(active_workspace)
                 and not str(model or "").strip()
                 and not asks_about_previous_language(prompt)
+                and not asks_about_capabilities(prompt)
             ):
                 direct_fast_lane = True
             if not direct_fast_lane:
                 semantic_subtask = None
                 deterministic_contract = None
             if fast_intro:
-                # Self-introduction is a short conversational explanation, not
-                # an exhaustive inventory. Never change the normal/code budget.
-                max_tokens = min(max_tokens, 192)
+                # P0.4.3c1: do not clip a grounded capability explanation to
+                # 192 tokens. Preserve both route-selected and caller ceilings;
+                # the normal shape policy below remains authoritative.
+                max_tokens = min(max_tokens, caller_max_tokens)
             # V8.4: spending a 320+ token budget for a one-sentence answer
             # burns time on CPU inference. Do not truncate deep/code requests.
             max_tokens = bounded_response_tokens(route_task, prompt, max_tokens)
@@ -1468,6 +1583,12 @@ class GovernedDirectMissionRunner:
                     "response."
                 ),
             )
+
+            # C1-FIXED2: bind the durable HTTP request identity to the real
+            # DIRECT Core task before any Workspace/Core effect can be tracked.
+            effect_journal = current_effect_journal()
+            if effect_journal is not None:
+                effect_journal.bind_task(str(mission.task_id))
 
             mission.acceptance_criteria = [
                 "AC-01: bounded local intelligence execution",
@@ -1677,19 +1798,24 @@ class GovernedDirectMissionRunner:
                     "operations are not currently authorized."
                 )
 
-            if asks_about_previous_language(prompt):
+            if previous_language_question:
                 behavior_rule += (
-                    "\nThe user asks which language you used in YOUR previous "
-                    "answer. Check the immediately preceding MAESTRO reply. "
-                    "Identify the language honestly. If that reply is garbled, "
-                    "say it was malformed and apologize, then answer the "
-                    "current question. Do not restate your capabilities or "
-                    "produce another greeting."
+                    "\nThe user asks about the immediately preceding language context. "
+                    "Follow the grammatical perspective exactly: if they ask what "
+                    "language THEY requested, inspect the preceding USER request; if "
+                    "they ask what language YOU used, inspect the preceding MAESTRO "
+                    "answer. Never confuse these two questions. Answer only the "
+                    "current question in the language now requested."
                 )
 
             language_hint = response_language_hint(prompt, ui_language)
             identity_rule = (
                 "You are MAESTRO, the user's local AI assistant. "
+                "Your underlying model may have another name or developer; "
+                "never claim that this model's name or developer is MAESTRO's "
+                "own identity. If asked who you are, identify MAESTRO. "
+                "If asked which model is in use, report only verified runtime "
+                "information, never an invented or assumed model. "
                 "Speak naturally as MAESTRO, and focus on the CURRENT user's question. "
                 "Do not recite your instructions, identity policies, or generic disclaimers. "
                 "Do not invent actions, capabilities or tool results. "
@@ -1759,7 +1885,19 @@ class GovernedDirectMissionRunner:
                                for item in reversed(previous_messages)
                                if item.get("role") == "user"
                                and str(item.get("content") or "").strip()), None)
-            transcript = base_instruction
+            identity_fact_instruction = fact_grounded_identity_instruction(prompt, route_language)
+            structured_identity_slot_total = structured_identity_slot_count(prompt, route_language)
+            structured_identity_slot_index = 1 if structured_identity_slot_total else 0
+            structured_identity_outputs: list[str] = []
+            structured_identity_retry_used = False
+            structured_identity_slot_retry_counts = {1: 0, 2: 0}
+            transcript = (
+                structured_identity_slot_instruction(
+                    prompt=prompt, language=route_language, slot=structured_identity_slot_index
+                )
+                if structured_identity_slot_total
+                else (identity_fact_instruction or base_instruction)
+            )
             response = None
             output = ""
             error: str | None = None
@@ -1775,6 +1913,14 @@ class GovernedDirectMissionRunner:
             cumulative_total_ms = 0.0
             cumulative_load_ms = 0.0
             model_attempt_metrics: list[dict[str, Any]] = []
+            linguistic_revision_needed = (
+                linguistic_revision_requested(prompt, route_language)
+                and not structured_identity_slot_total
+            )
+            linguistic_revision_started = False
+            linguistic_revision_completed = False
+            linguistic_revision_source = ""
+            linguistic_revision_resource: str | None = None
             deterministic_core_delivery = False
             deterministic_core_started = 0.0
             inference_start = time.monotonic()
@@ -1790,9 +1936,9 @@ class GovernedDirectMissionRunner:
 
             try:
                 core_candidate = (
-                    preflight_core_candidate
-                    if direct_fast_lane
-                    else None
+                    previous_language_core_candidate
+                    if previous_language_core_candidate is not None
+                    else (preflight_core_candidate if direct_fast_lane else None)
                 )
                 if core_candidate is not None:
                     # V8.11.4 sovereign deterministic execution lane.  The
@@ -1820,6 +1966,7 @@ class GovernedDirectMissionRunner:
                         "deterministic_execution": True,
                         "deterministic_core_execution": True,
                         "deterministic_core_subtask": semantic_subtask,
+                        "governed_identity_projection": False,
                         "deterministic_core_ms": round(
                             (time.monotonic() - deterministic_core_started) * 1000, 3
                         ),
@@ -1843,7 +1990,15 @@ class GovernedDirectMissionRunner:
                                 IntelligenceCapability.DIRECT
                             ),
                             instruction=transcript,
-                            max_tokens=max_tokens,
+                            max_tokens=(
+                                min(max_tokens, 96)
+                                if structured_identity_slot_total
+                                else (
+                                    min(max_tokens, 128)
+                                    if linguistic_revision_started and normalized_language(route_language) == "ar"
+                                    else max_tokens
+                                )
+                            ),
                             execution_profile=local_execution_profile(
                                 route_task, quality_retry=quality_retries,
                                 manual_override=(model is not None and bool(str(model).strip())),
@@ -1919,7 +2074,8 @@ class GovernedDirectMissionRunner:
                                     and routing_decision.task_class in {"quick", "normal"}
                                     and not active_workspace
                                     and timeout_recoveries == 0
-                                    and quality_retries == 0):
+                                    and quality_retries == 0
+                                    and not linguistic_revision_started):
                                 alternative = choose_timeout_fallback(
                                     registry, resource_id, self._conversations.root,
                                     task_class=routing_decision.task_class,
@@ -1962,15 +2118,26 @@ class GovernedDirectMissionRunner:
                         candidate = str(
                             response.output or ""
                         ).strip()
-                        # G4A: no additional inference, provider changes or semantic claims.
-                        # Only replace layout when the original text is otherwise preserved.
+                        # G4A/FIX10: no additional inference, provider changes or semantic claims.
+                        # Only repair mechanically provable delivery shape while preserving
+                        # every generated word.  FIX10 first handles the common two-line /
+                        # missing-terminal-punctuation case, then retains the historical
+                        # two-paragraph spacing repair.
                         _g4a_repaired = False
+                        _g4a_repair_kind = None
                         if not active_workspace and not direct_fast_lane:
+                            from .lossless_sentence_repair import propose_lossless_two_sentence_line_repair
+                            _sentence_candidate = propose_lossless_two_sentence_line_repair(prompt, candidate)
+                            if _sentence_candidate is not None:
+                                candidate = _sentence_candidate
+                                _g4a_repaired = True
+                                _g4a_repair_kind = "g4a_lossless_two_sentence_punctuation"
                             from .quality_shape_repair import propose_lossless_two_paragraph_repair
                             _g4a_candidate = propose_lossless_two_paragraph_repair(prompt, candidate)
                             if _g4a_candidate is not None:
                                 candidate = _g4a_candidate
                                 _g4a_repaired = True
+                                _g4a_repair_kind = "g4a_lossless_spacing_two_paragraphs"
 
                         raw_metrics = dict(
                             getattr(
@@ -2031,9 +2198,7 @@ class GovernedDirectMissionRunner:
                         model_attempt_metrics.append({
                             "resource_id": resource_id,
                             "model_fingerprint": attempt_fingerprint,
-                            "quality_shape_repair": (
-                                "g4a_lossless_spacing_two_paragraphs" if _g4a_repaired else None
-                            ),
+                            "quality_shape_repair": _g4a_repair_kind,
                             "quality_evidence": capture_attempt_quality(
                                 prompt, candidate,
                                 metrics.get("done_reason") or metrics.get("finish_reason"),
@@ -2139,6 +2304,17 @@ class GovernedDirectMissionRunner:
                                 )
                                 attempt["arguments"] = arguments
 
+                                # A terminal command may have irreversible
+                                # filesystem effects. Persist intent + engaged
+                                # state before calling the authorized executor.
+                                effect_journal = current_effect_journal()
+                                terminal_effect = None
+                                if effect_journal is not None and tool_name == "terminal.run":
+                                    terminal_effect = effect_journal.prepare(
+                                        "WORKSPACE", "terminal.run",
+                                        {"workspace_id": active_workspace["id"],
+                                         "name": tool_name, "arguments": arguments})
+                                    effect_journal.engage(terminal_effect)
                                 tool_result = (
                                     self._workspaces.execute_tool(
                                         active_workspace["id"],
@@ -2147,6 +2323,8 @@ class GovernedDirectMissionRunner:
                                         cancellation=cancellation,
                                     )
                                 )
+                                if terminal_effect is not None:
+                                    effect_journal.observe(terminal_effect, {"result": tool_result})
 
                                 if cancellation is not None and cancellation.is_set():
                                     raise MissionCancelledError(
@@ -2197,6 +2375,13 @@ class GovernedDirectMissionRunner:
                                 FileNotFoundError,
                                 OSError,
                             ) as exc:
+                                # Once the terminal call was ENGAGED, an OSError
+                                # or ValueError can occur AFTER external effects.
+                                # Never invite the model to repeat that call.
+                                if terminal_effect is not None:
+                                    raise RequestReplayBlocked(
+                                        "Terminal effect outcome uncertain; manual reconciliation required"
+                                    ) from exc
                                 tool_failures += 1
                                 attempt["error"] = (
                                     f"{type(exc).__name__}: {exc}"
@@ -2230,6 +2415,91 @@ class GovernedDirectMissionRunner:
 
                             continue
 
+                        # FIX16: explicit DE/AR MAESTRO identity questions are
+                        # generated as semantic sentence slots.  The selected local
+                        # model writes every user-facing sentence; the Core only
+                        # validates each slot and joins them mechanically.
+                        if structured_identity_slot_total:
+                            _slot_ok, _slot_reason, _slot_sentence = validate_structured_identity_slot(
+                                candidate, route_language, structured_identity_slot_index
+                            )
+                            model_attempt_metrics[-1]["structured_identity_slot"] = structured_identity_slot_index
+                            model_attempt_metrics[-1]["structured_identity_slot_reason"] = _slot_reason
+                            if _slot_reason == "explicit_shape_arabic_only_foreign_script":
+                                model_attempt_metrics[-1]["foreign_script_tokens"] = list(
+                                    foreign_alpha_tokens_except_maestro(candidate)
+                                )
+                            if not _slot_ok:
+                                model_attempt_metrics[-1]["outcome"] = "structured_identity_slot_rejected"
+                                quality_reason = _slot_reason
+                                model_attempt_metrics[-1]["quality_guard_reason"] = _slot_reason
+                                model_attempt_metrics[-1]["quality_guard_accepted"] = False
+                                model_attempt_metrics[-1]["quality_guard_stage"] = "structured_identity_slot"
+                                if structured_identity_slot_retry_counts.get(structured_identity_slot_index, 0) < 2:
+                                    structured_identity_retry_used = True
+                                    structured_identity_slot_retry_counts[structured_identity_slot_index] = (
+                                        structured_identity_slot_retry_counts.get(structured_identity_slot_index, 0) + 1
+                                    )
+                                    quality_retries += 1
+                                    model_attempt_metrics[-1]["structured_identity_slot_retry"] = True
+                                    transcript = structured_identity_slot_retry_instruction(
+                                        prompt=prompt, language=route_language,
+                                        slot=structured_identity_slot_index, reason=_slot_reason,
+                                        attempt=structured_identity_slot_retry_counts[structured_identity_slot_index],
+                                    )
+                                    continue
+                                from .quality_contract_failure import QualityContractFailure
+                                raise QualityContractFailure(_slot_reason, route_language)
+
+                            structured_identity_outputs.append(_slot_sentence)
+                            model_attempt_metrics[-1]["outcome"] = "structured_identity_slot_accepted"
+                            model_attempt_metrics[-1]["quality_guard_reason"] = _slot_reason
+                            model_attempt_metrics[-1]["quality_guard_accepted"] = True
+                            model_attempt_metrics[-1]["quality_guard_stage"] = "structured_identity_slot"
+                            if structured_identity_slot_index < structured_identity_slot_total:
+                                structured_identity_slot_index += 1
+                                transcript = structured_identity_slot_instruction(
+                                    prompt=prompt, language=route_language,
+                                    slot=structured_identity_slot_index,
+                                )
+                                continue
+
+                            candidate = compose_structured_identity_slots(structured_identity_outputs)
+                            from .language_quality_governor import verified_surface_violation
+                            whole_defect = verified_surface_violation(candidate, route_language)
+                            if whole_defect is not None:
+                                from .quality_contract_failure import QualityContractFailure
+                                quality_reason = whole_defect
+                                model_attempt_metrics[-1]["quality_guard_reason"] = whole_defect
+                                model_attempt_metrics[-1]["quality_guard_accepted"] = False
+                                model_attempt_metrics[-1]["quality_guard_stage"] = "composed_identity"
+                                raise QualityContractFailure(whole_defect, route_language)
+                            quality = evaluate_response(
+                                prompt, candidate, prior_output=prior_assistant,
+                                prior_user_prompt=prior_user, capability_snapshot=capability_snapshot,
+                                completion_reason=None,
+                            )
+                            if quality.accepted and maestro_identity_contradicted(candidate, route_language):
+                                quality = QualityResult(False, "maestro_identity_contradicted", 0.0)
+                            if (
+                                quality.accepted
+                                and structured_identity_slot_total == 2
+                                and not maestro_identity_grounded(candidate, route_language)
+                            ):
+                                quality = QualityResult(False, "maestro_identity_not_grounded", 0.0)
+                            quality_reason = quality.reason
+                            model_attempt_metrics[-1]["quality_guard_reason"] = quality.reason
+                            model_attempt_metrics[-1]["quality_guard_accepted"] = bool(quality.accepted)
+                            model_attempt_metrics[-1]["quality_guard_stage"] = "composed_identity"
+                            if not quality.accepted:
+                                from .quality_contract_failure import QualityContractFailure
+                                raise QualityContractFailure(quality.reason, route_language)
+                            output = candidate
+                            metrics["structured_identity_generation"] = True
+                            metrics["structured_identity_slots"] = structured_identity_slot_total
+                            metrics["structured_identity_slot_outputs"] = list(structured_identity_outputs)
+                            break
+
                         quality = evaluate_response(
                             prompt,
                             candidate,
@@ -2240,6 +2510,19 @@ class GovernedDirectMissionRunner:
                                 metrics.get("done_reason") or metrics.get("finish_reason")
                             ),
                         )
+                        if (
+                            quality.accepted
+                            and maestro_identity_grounding_required(prompt, route_language)
+                            and maestro_identity_contradicted(candidate, route_language)
+                        ):
+                            quality = QualityResult(False, "maestro_identity_contradicted", 0.0)
+                        if (
+                            quality.accepted
+                            and maestro_identity_grounding_required(prompt, route_language)
+                            and not maestro_identity_grounded(candidate, route_language)
+                        ):
+                            quality = QualityResult(False, "maestro_identity_not_grounded", 0.0)
+
                         semantic_check = (
                             verify_deterministic_response(prompt, candidate)
                             if direct_fast_lane and deterministic_contract is not None
@@ -2276,6 +2559,16 @@ class GovernedDirectMissionRunner:
                                         0.0,
                                     )
                         quality_reason = quality.reason
+                        # G1 receipt only: record the evaluated decision per inference
+                        # attempt; NEVER change the guard result or retry policy.
+                        # No prompt, answer text, user data or provider credentials.
+                        model_attempt_metrics[-1]["quality_guard_reason"] = quality.reason
+                        model_attempt_metrics[-1]["quality_guard_accepted"] = bool(quality.accepted)
+                        model_attempt_metrics[-1]["quality_guard_stage"] = "response"
+                        if quality.reason == "explicit_shape_arabic_only_foreign_script":
+                            model_attempt_metrics[-1]["foreign_script_tokens"] = list(
+                                foreign_alpha_tokens_except_maestro(candidate)
+                            )
                         # A successful HTTP request is not yet a successful answer.
                         # Deterministic semantic failures are scoped evidence and do
                         # not poison the model's generic conversational qualification.
@@ -2289,6 +2582,33 @@ class GovernedDirectMissionRunner:
                         # successful unassisted model-format attempt.
                         if _g4a_repaired and quality.accepted:
                             model_attempt_metrics[-1]["outcome"] = "quality_repaired_by_core_formatting"
+
+                        # FIX14: an explicit request for natural/correct DE or AR gets one
+                        # native-language polish pass on the SAME already-selected resource.
+                        # This is not model failover and grants no new authority. The first
+                        # structurally acceptable draft is never published before this pass.
+                        if (
+                            linguistic_revision_needed
+                            and not linguistic_revision_started
+                            and not active_workspace
+                            and not direct_fast_lane
+                            and (quality.accepted or repairable_linguistic_draft(quality.reason, candidate))
+                        ):
+                            linguistic_revision_source = candidate
+                            linguistic_revision_started = True
+                            linguistic_revision_resource = resource_id
+                            model_attempt_metrics[-1]["linguistic_revision_source_quality_reason"] = quality.reason
+                            model_attempt_metrics[-1]["outcome"] = (
+                                "linguistic_revision_draft_accepted"
+                                if quality.accepted else "linguistic_revision_draft_repairable"
+                            )
+                            transcript = native_revision_instruction(
+                                prompt=prompt, draft=candidate, language=route_language
+                            )
+                            continue
+
+                        if quality.accepted and linguistic_revision_started:
+                            linguistic_revision_completed = True
 
                         # V8.5.1: length is a caller/output-budget problem, not a
                         # semantic model failure. V8.5 incorrectly re-ran the
@@ -2309,16 +2629,39 @@ class GovernedDirectMissionRunner:
                             and timeout_recoveries == 0
                         ):
                             quality_retries += 1
+                            linguistic_revision_retry = bool(
+                                linguistic_revision_started
+                                and linguistic_revision_source
+                                and linguistic_revision_resource == resource_id
+                            )
                             # Only AUTO may escalate, and only to a previously
                             # registered resource with existing DIRECT capability.
                             alternative = None
-                            if routing_decision is not None and not active_workspace:
+                            language_script_retry = quality.reason in {
+                                "explicit_shape_arabic_only_foreign_script",
+                                "explicit_shape_german_only_foreign_script",
+                                "user_instruction_echo",
+                                "direct_answer_meta_preamble",
+                                "direct_answer_question_restatement",
+                                "maestro_identity_not_grounded",
+                                "maestro_identity_contradicted",
+                            }
+                            benchmark_contract_retry = _benchmark_contract_retry_stays_on_resource(
+                                primary_selection, prompt, quality.reason
+                            )
+                            if (routing_decision is not None and not active_workspace
+                                    and not language_script_retry
+                                    and not benchmark_contract_retry
+                                    and not linguistic_revision_retry):
                                 alternative = choose_quality_fallback(
                                     registry, resource_id, self._conversations.root,
                                     task_class=routing_decision.task_class,
                                     language=route_language,
                                     remaining_seconds=max(0., mission_deadline-time.monotonic()),
                                     semantic_subtask=semantic_subtask,
+                                    allow_provisional_language_trial=(
+                                        explicit_requested_language(prompt) is not None
+                                    ),
                                 )
                             if alternative is not None:
                                 if primary_selection is not None:
@@ -2339,39 +2682,96 @@ class GovernedDirectMissionRunner:
                                 adapter = registry.adapter(alternative)
                                 resource_id = alternative
                                 quality_escalations += 1
+                            # FIX14-FIXED1: if the dedicated linguistic revision itself
+                            # fails a delivery contract, consume the existing single
+                            # quality retry by revising the ORIGINAL accepted draft again
+                            # on the same resource. Do not fall back to generic conversation.
+                            if linguistic_revision_retry:
+                                model_attempt_metrics[-1]["linguistic_revision_retry_reason"] = quality.reason
+                                # Historical default invariant: draft=linguistic_revision_source.
+                                # FIX14-FIXED3 narrows only the Arabic foreign-script case
+                                # to the failed revision candidate for a local script repair.
+                                _identity_progressive_retry = bool(identity_fact_instruction)
+                                _revision_retry_draft = (
+                                    candidate
+                                    if _identity_progressive_retry
+                                    or (normalized_language(route_language) == "ar"
+                                        and quality.reason == "explicit_shape_arabic_only_foreign_script")
+                                    else linguistic_revision_source
+                                )
+                                model_attempt_metrics[-1]["linguistic_revision_retry_source"] = (
+                                    "latest_identity_revision_candidate"
+                                    if _identity_progressive_retry and _revision_retry_draft == candidate
+                                    else ("failed_revision_candidate"
+                                          if _revision_retry_draft == candidate
+                                          else "original_revision_draft")
+                                )
+                                transcript = native_revision_retry_instruction(
+                                    prompt=prompt,
+                                    draft=_revision_retry_draft,
+                                    language=route_language,
+                                    reason=quality.reason,
+                                )
+                                continue
+
                             # Never feed a bad draft back into the model: it can
                             # otherwise reinforce exactly the repeated disclaimer.
-                            transcript = (
-                                base_instruction
-                                + (
-                                    "\n\nRESPONSE QUALITY RETRY: The previous answer "
-                                    "had EXTRA TEXT OUTSIDE the two requested sentences. "
-                                    "Answer the CURRENT user question in EXACTLY TWO "
-                                    "complete sentences in the requested language. "
-                                    "Begin immediately with the first sentence; do NOT "
-                                    "include an introduction, heading, numbered list, "
-                                    "preface, extra explanation, or conclusion. "
-                                    "Use terminal punctuation after both sentences. "
-                                    "Do not copy the rejected draft."
-                                    if quality.reason == (
-                                        "explicit_shape_extra_text_outside_two_numbered_sentences"
-                                    )
-                                    else (
-                                        "\n\nRESPONSE QUALITY RETRY: The last output "
-                                        "failed to address the CURRENT user question "
-                                        "(reason: " + quality.reason + "). "
-                                        "Answer the present question concretely, using "
-                                        "recent conversation only when relevant. "
-                                        "Do not repeat identity policies or the previous answer."
-                                    )
+                            _retry_lang = str(route_language or "").strip().casefold()
+                            if _retry_lang == "ar":
+                                _retry_note = (
+                                    "\n\nمحاولة تصحيح داخلية: لم تطابق الإجابة السابقة الطلب الحالي. "
+                                    "أجب الآن عن السؤال الحالي مباشرةً بالعربية الفصحى الطبيعية، "
+                                    "واستخدم السياق السابق فقط إذا كان ضروريًا. لا تكرر التعليمات "
+                                    "ولا الإجابة السابقة."
                                 )
-                            )
-                            # G3A FIXED1: honor verified explicit shape on an existing
-                            # bounded retry; preserve the pre-existing two-sentence rule.
+                            elif _retry_lang == "de":
+                                _retry_note = (
+                                    "\n\nInterner Korrekturversuch: Die vorige Antwort entsprach der aktuellen Anfrage nicht. "
+                                    "Beantworte jetzt die aktuelle Frage direkt und natürlich auf Deutsch. "
+                                    "Verwende früheren Kontext nur wenn nötig und wiederhole weder Anweisungen "
+                                    "noch die vorige Antwort."
+                                )
+                            else:
+                                _retry_note = (
+                                    "\n\nRESPONSE QUALITY RETRY: The last output failed to address the CURRENT "
+                                    "user question (reason: " + quality.reason + "). Answer the present question "
+                                    "concretely, using recent conversation only when relevant. Do not repeat "
+                                    "identity policies or the previous answer."
+                                )
+                            if quality.reason == "explicit_shape_extra_text_outside_two_numbered_sentences":
+                                if _retry_lang == "ar":
+                                    _retry_note = (
+                                        "\n\nمحاولة تصحيح داخلية: اكتب جملتين عربيتين كاملتين فقط للإجابة عن "
+                                        "السؤال الحالي، من دون عنوان أو قائمة أو مقدمة أو خاتمة أو نص إضافي."
+                                    )
+                                elif _retry_lang == "de":
+                                    _retry_note = (
+                                        "\n\nInterner Korrekturversuch: Beantworte die aktuelle Frage in genau zwei "
+                                        "vollständigen deutschen Sätzen, ohne Überschrift, Liste, Einleitung, "
+                                        "Schluss oder zusätzlichen Text."
+                                    )
+                                else:
+                                    _retry_note = (
+                                        "\n\nRESPONSE QUALITY RETRY: The previous answer had EXTRA TEXT OUTSIDE "
+                                        "the two requested sentences. Answer the CURRENT user question in EXACTLY "
+                                        "TWO complete sentences in the requested language. Begin immediately with "
+                                        "the first sentence; do NOT include an introduction, heading, numbered list, "
+                                        "preface, extra explanation, or conclusion. Use terminal punctuation after "
+                                        "both sentences. Do not copy the rejected draft."
+                                    )
+                            transcript = (identity_fact_instruction or base_instruction) + _retry_note
+                            # G3A/FIX9: honor verified explicit shape on the bounded
+                            # retry, using a label in the requested language so a strict
+                            # Arabic-only request is never primed with Latin meta-text.
                             from .quality_retry_contract import contract_retry_hint
                             _g3a_hint = contract_retry_hint(quality.reason, route_language)
                             if _g3a_hint:
-                                transcript += "\n\nEXACT OUTPUT CONTRACT: " + _g3a_hint
+                                if _retry_lang == "ar":
+                                    transcript += "\n\nقاعدة الإخراج للمحاولة الجديدة: " + _g3a_hint
+                                elif _retry_lang == "de":
+                                    transcript += "\n\nAusgaberegel für den neuen Versuch: " + _g3a_hint
+                                else:
+                                    transcript += "\n\nEXACT OUTPUT CONTRACT: " + _g3a_hint
                             continue
 
                         if not quality.accepted:
@@ -2423,6 +2823,16 @@ class GovernedDirectMissionRunner:
                     quality_retries
                 ),
                 "quality_reason": quality_reason,
+                "linguistic_revision_requested": linguistic_revision_needed,
+                "linguistic_revision_applied": linguistic_revision_started,
+                "linguistic_revision_completed": linguistic_revision_completed,
+                "linguistic_revision_resource": linguistic_revision_resource,
+                "linguistic_revision_same_resource": (
+                    not linguistic_revision_started or linguistic_revision_resource == resource_id
+                ),
+                "linguistic_revision_retry_used": bool(
+                    linguistic_revision_started and quality_retries > 0
+                ),
                 "routing_policy": (
                     routing_decision.policy
                     if routing_decision
@@ -2469,6 +2879,14 @@ class GovernedDirectMissionRunner:
                     model_attempt_metrics, deterministic_core=deterministic_core_delivery
                 ),
                 "deterministic_core_execution": deterministic_core_delivery,
+                "governed_identity_projection": False,
+                "sovereign_identity_fact_grounding": bool(
+                    identity_fact_instruction or structured_identity_slot_total
+                ),
+                "structured_identity_generation": bool(structured_identity_slot_total),
+                "structured_identity_slots": structured_identity_slot_total,
+                "structured_identity_slot_retry_used": structured_identity_retry_used,
+                "structured_identity_slot_retry_counts": dict(structured_identity_slot_retry_counts),
                 "provider_model_called": bool(resource_calls),
                 "selected_primary_resource_id": resource_id,
                 "model_inventory_required": not deterministic_core_delivery,
@@ -2498,6 +2916,23 @@ class GovernedDirectMissionRunner:
                 passed = False
                 output = ""
                 error = "MissionCancelledError: Mission cancelled before durable commit"
+            # FIX16-FIXED7: public distinction between deterministic technical
+            # shape acceptance and independent (incomplete) language assessment.
+            # Never label fluent just because the response guard accepted it.
+            if structured_identity_slot_total and resource_calls:
+                from .language_quality_governor import assess_language_quality
+                language_finding = assess_language_quality(output, route_language) if passed else None
+                metrics['technical_contract_status'] = 'accepted' if passed else 'rejected'
+                metrics['language_quality_status'] = (
+                    language_finding.status if language_finding is not None
+                    else ('known_defect' if str(quality_reason).startswith('linguistic_') else 'not_assessed')
+                )
+                metrics['language_quality_reason'] = (
+                    language_finding.reason if language_finding is not None
+                    else (quality_reason if str(quality_reason).startswith('linguistic_') else None)
+                )
+                metrics['language_quality_certified'] = False
+                metrics['language_quality_evidence_origin'] = 'bounded_known_defect_screen'
             if passed:
                 kernel.succeed_dag_node(
                     mission,
@@ -2682,9 +3117,22 @@ class GovernedDirectMissionRunner:
                 kernel.authorize_durable_commit(
                     mission
                 )
+
+                # C1-FIXED2: write PREPARED/ENGAGED before the durable Core
+                # commit. If commit or observation fails after an effect, the
+                # request remains uncertain and is never replayed automatically.
+                effect_journal = current_effect_journal()
+                core_effect = None
+                if effect_journal is not None:
+                    core_effect = effect_journal.prepare(
+                        "CORE", "commit_durable_state",
+                        {"task_id": str(mission.task_id)})
+                    effect_journal.engage(core_effect)
                 kernel.commit_durable_state(
                     mission
                 )
+                if core_effect is not None:
+                    effect_journal.observe(core_effect, {"returned": True})
 
                 kernel.close(
                     mission,
@@ -2872,6 +3320,50 @@ class GovernedDirectMissionRunner:
                         attempt.get("wall_ms"),
                         model_fingerprint=attempt.get("model_fingerprint"),
                     )
+            # FIX16-FIXED6: exactly one language-quality observation per
+            # completed model-backed identity mission, not per slot/retry.
+            # Failed/cancelled unrelated work is ignored by the evidence store.
+            if (primary_selection is not None and structured_identity_slot_total
+                    and resource_calls and route_language in {'de', 'ar'}):
+                self._core.primary_intelligence.note_language_quality(
+                    resource_id, route_language, accepted=bool(result.get('ok')),
+                    quality_reason=(quality_reason if not result.get('ok') else 'accepted'),
+                    expected_epoch=primary_selection.epoch,
+                )
+            # P0.4.1: source-attributed, digest-scoped operational telemetry.
+            # This is NOT objective/linguistic qualification: a successful
+            # response guard and HTTP 200 are deliberately counted only as
+            # TECHNICAL_DELIVERED. A deterministic Core result has no LLM
+            # evidence. Only a current Primary epoch can record the receipt.
+            if (primary_selection is not None and resource_calls
+                    and not deterministic_core_delivery and resource_id
+                    and metrics.get('response_origin') == 'local_model'):
+                _status = 'TECHNICAL_DELIVERED' if passed else 'CONTRACT_REJECTED'
+                if not passed and (
+                    str(quality_reason).startswith('linguistic_')
+                    or str(quality_reason).startswith('maestro_identity_')
+                    or str(quality_reason).startswith('identity_slot_')
+                ):
+                    _status = 'LINGUISTIC_DEFECT'
+                elif not passed and (
+                    'timeout' in str(error or '').lower()
+                    or 'ollamahttperror' in str(error or '').lower()
+                ):
+                    _status = 'RUNTIME_FAILURE'
+                elif passed:
+                    from .language_quality_governor import assess_language_quality
+                    if assess_language_quality(output, route_language).status == 'known_defect':
+                        _status = 'LINGUISTIC_DEFECT'
+                _observer = getattr(self._core.primary_intelligence, 'note_sovereign_observation', None)
+                _ledger_result = (
+                    _observer(resource_id, route_language, route_task, _status,
+                              str(result['task_id']), expected_epoch=primary_selection.epoch)
+                    if callable(_observer) else 'manager_without_ledger'
+                )
+                result.setdefault('metrics', {})['p04_evidence_receipt'] = _ledger_result
+                result['metrics']['p04_evidence_status'] = _status
+                result['metrics']['p04_objective_certified'] = False
+                result['metrics']['p04_fluency_certified'] = False
             if _should_note_model_success(
                 ok=bool(result.get("ok")),
                 primary_selection=primary_selection,

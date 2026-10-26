@@ -208,3 +208,31 @@ model load and generation latency. All real G1/G2/G3 release gates remain closed
   inference or model downloads, and no semantic claims from tiny probes.
 - **Release status: BLOCKED**. G1 full P0 closure, G2 semantic language review
   and G3 notarized macOS distribution are not certified by this integration.
+
+<!-- MAESTRO-P043C0-URGENT-START -->
+## P0 CRITICAL — Restaurer la chaîne conversationnelle réelle (URGENT, BLOCK)
+
+**Tâche impérative, à appliquer avant toute nouvelle annonce de réussite conversationnelle :**
+> C'est de corriger la chaîne réelle entrée utilisateur → détection linguistique → sélection du modèle → génération → contrôle qualité → affichage.
+
+**Incident LIVE utilisateur — 24 octobre 2026** :
+- `wer bist du?` (DE) a produit « Ich bin Qwen, der von Alibaba Cloud entwickelt wurde. » : **FAIL identité de l'assistant**. MAESTRO reste MAESTRO, le modèle et son fournisseur sont des attributs transparents vérifiés dans le runtime lorsqu'ils sont demandés.
+- `sta mozes raditi` (HR sans diacritiques) a échoué sur « Response generation exhausted its configured token budget (192) » : **FAIL livraison/gestion du budget**. Aucune génération partielle ne doit être présentée comme un succès.
+- `dobar dan` (HR) a produit « Hallo! Wie geht es Ihnen heute? » : **FAIL langue courante**. La langue du message courant prime sur la langue de l'UI et sur les tours précédents, sauf demande explicite contraire ou ambiguïté démontrée.
+
+**Preuve quantitative existante** : `MAESTRO_SIQ_20261023_190709.json`, SHA-256 `d60f7d3df0e2b4635fbbf38d33349a7d30ed2d2cd7df4e8728396b17bde6c7c5` ; 226 exécutés, 88 PASS_OBJECTIVE, 116 FAIL, 22 OBSERVED_UNVERIFIED. Croate : 21 FAIL sur 26 ; arabe : 20 FAIL sur 26 ; verdict Guardian `BLOCK`, `language_fluency_certified=false`.
+
+### Ordre d'exécution obligatoire
+1. **Entrée** : tracer langue du message courant, langue explicite demandée, langue UI, contexte de conversation, identifiant de requête, sans exposer de données personnelles.
+2. **Détection linguistique** : diagnostiquer et corriger les erreurs HR (y compris sans diacritiques), DE et changements de langue ; préserver EN/FR/DE/AR/PT/ES/HR/IT, sans priorité spéciale au français.
+3. **Sélection du modèle** : enregistrer l'ID exact du modèle réellement choisi, sa version/digest et la raison de sélection ; ne jamais confondre fournisseur du modèle et identité MAESTRO ; zéro cloud, zéro téléchargement automatique.
+4. **Génération** : examiner le raccourci `fast_intro` / budget 192, classifier les dépassements et gérer un éventuel nouvel essai borné seulement si les effets et le transport le permettent ; ne pas introduire de boucle infinie ni de concurrence avec le Primary.
+5. **Contrôle qualité** : évaluer identité factuelle, langue réellement écrite, pertinence, complétude et budget. Les jugements doivent venir du texte réellement généré, avec raisons vérifiables ; aucun PASS déduit de HTTP 200 ni de réponses déterministes comme `433`.
+6. **Affichage** : vérifier la réponse vue dans l'UI React ORIGINALE, avec origine du modèle et statut d'erreur sans masquage. **INTERDICTION de modifier, remplacer, reconstruire ou substituer l'UI originale** pour cette tâche.
+7. **Validation Mac LIVE** : refaire les 3 prompts fautifs en interface, puis une matrice 8 langues, alternance DE→HR→DE, réponses longues, budgets bas, redémarrage et persistance ; preuves textuelles/trace par mission ; toute régression critique bloque la certification.
+8. **Gouvernance** : régressions Core/Gateway sont nécessaires mais insuffisantes. `PASS_TECHNICAL` et `PASS_CONVERSATIONAL` sont deux verdicts distincts. Aucun checkpoint « stable » ni promotion automatique avant preuves LIVE et approbation Guardian.
+
+**Invariants** : Primary local souverain unique, aucune inférence idle non certifiée, aucun téléchargement de modèles, Core zéro-modèle préservé, preuve d'arrêt fournisseur et coordination de tous les chemins restent BLOCK. Ne jamais masquer les FAIL historiques.
+
+**Statut au 24 octobre 2026** : `P0_CRITICAL / REMEDIATE`, aucune correction de production installée par cette seule mise à jour RoadMap.
+<!-- MAESTRO-P043C0-URGENT-END -->

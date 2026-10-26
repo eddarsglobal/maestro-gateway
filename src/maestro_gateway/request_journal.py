@@ -137,7 +137,8 @@ def _atomic_write(path: Path, record: dict[str, Any]) -> None:
 
 def _make_record(request_hash: str, request_fingerprint: str, state: str,
                  *, result: dict[str, Any] | None = None,
-                 detail: str | None = None) -> dict[str, Any]:
+                 detail: str | None = None,
+                 effects_sha256: str | None = None) -> dict[str, Any]:
     doc = {'schema': SCHEMA, 'request_hash': request_hash,
            'request_fingerprint': request_fingerprint, 'state': state,
            'updated_at': _now()}
@@ -145,6 +146,10 @@ def _make_record(request_hash: str, request_fingerprint: str, state: str,
         doc['result'] = result
     if detail is not None:
         doc['detail'] = detail
+    if effects_sha256 is not None:
+        if not isinstance(effects_sha256, str) or not re.fullmatch('[a-f0-9]{64}', effects_sha256):
+            raise ValueError('Invalid effect proof')
+        doc['effects_sha256'] = effects_sha256
     doc['checksum'] = fingerprint(doc)
     return doc
 
@@ -160,6 +165,10 @@ def _check_record(doc: Any, request_hash: str, request_fingerprint: str) -> dict
         raise RequestReplayBlocked('Same request ID has different request payload')
     if doc.get('state') not in ('STARTED_UNCERTAIN', 'COMPLETED', 'RECONCILIATION_REQUIRED'):
         raise RequestReplayBlocked('Unrecognized persisted request state')
+    if 'effects_sha256' in doc and (doc['state'] != 'COMPLETED' or
+         not isinstance(doc['effects_sha256'], str) or
+         not re.fullmatch('[a-f0-9]{64}', doc['effects_sha256'])):
+        raise RequestReplayBlocked('Invalid effect proof in request receipt')
     if doc['state'] == 'COMPLETED':
         result = doc.get('result')
         if not isinstance(result, dict) or not isinstance(result.get('task_id'), str) or not isinstance(result.get('conversation_id'), str):
@@ -220,7 +229,7 @@ class RequestLease:
                 raise
 
     def _transition(self, state: str, *, result: dict[str, Any] | None = None,
-                    detail: str | None = None) -> None:
+                    detail: str | None = None, effects_sha256: str | None = None) -> None:
         if self._closed or self.fd is None or self.existing is not None:
             raise RuntimeError('Cannot mutate a closed or existing request lease')
         old = _check_record(json.loads(_no_follow_read(self.path)),
@@ -228,12 +237,12 @@ class RequestLease:
         if old['state'] != 'STARTED_UNCERTAIN':
             raise RequestReplayBlocked('Request state changed unexpectedly')
         _atomic_write(self.path, _make_record(self.request_hash, self.request_fingerprint,
-                                             state, result=result, detail=detail))
+                                             state, result=result, detail=detail, effects_sha256=effects_sha256))
 
-    def complete(self, result: dict[str, Any]) -> None:
+    def complete(self, result: dict[str, Any], *, effects_sha256: str | None = None) -> None:
         if not isinstance(result, dict):
             raise ValueError('Completed result must be a JSON object')
-        self._transition('COMPLETED', result=result)
+        self._transition('COMPLETED', result=result, effects_sha256=effects_sha256)
 
     def uncertain(self, detail: str) -> None:
         if not re.fullmatch('[A-Za-z0-9_.:-]{1,90}', detail or ''):
@@ -300,7 +309,7 @@ class MissionRequestJournal:
                 'task_id': state.get('result', {}).get('task_id'),
                 'conversation_id': state.get('result', {}).get('conversation_id')}
 
-    def read_completed_only(self, request_id: str, request_fingerprint: str) -> dict[str, Any]:
+    def read_completed_record_only(self, request_id: str, request_fingerprint: str) -> dict[str, Any]:
         """Read-only verified replay: never creates a lock or a STARTED receipt.
 
         In particular, a completed cancellation record without the matching
@@ -322,4 +331,7 @@ class MissionRequestJournal:
         state = _check_record(record, name, request_fingerprint)
         if state['state'] != 'COMPLETED':
             raise RequestReplayBlocked('Prior request outcome uncertain; no Core replay')
-        return dict(state['result'])
+        return state
+
+    def read_completed_only(self, request_id: str, request_fingerprint: str) -> dict[str, Any]:
+        return dict(self.read_completed_record_only(request_id, request_fingerprint)['result'])

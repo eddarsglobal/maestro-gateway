@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from .response_guard import asks_about_capabilities, asks_about_previous_language, asks_for_software_project
-from .model_qualification import qualification, warm_qualifications
+from .multilingual_mission_contract import parse_mission_contract
+from .response_effort import conversation_context_required
+from .model_qualification import qualification, task_qualification, warm_qualifications
 from .semantic_competence import semantic_qualification, warm_semantic_qualifications
 from .autonomous_qualification import rank_adjustment, model_version
 
@@ -66,11 +68,20 @@ def classify_request(prompt: str, *, workspace_active: bool = False,
                      ui_language: str | None = None) -> str:
     if asks_for_software_project(prompt):
         return "code"
-    if workspace_active or _COMPLEX.search(prompt):
+    if workspace_active:
+        return "code" if _CODE.search(prompt) else "complex"
+    # Conversation references must be resolved before lexical software routing.
+    # A phrase such as "Quel était le code fictif ?" uses the ordinary noun
+    # "code" but is a memory/follow-up request, not a programming task.
+    if conversation_context_required(prompt):
+        return "normal"
+    if _COMPLEX.search(prompt):
         return "code" if _CODE.search(prompt) else "complex"
     # Self-capabilities require enough model capacity and a real live catalogue.
     # A small greeting model must not invent or repeat a slogan instead.
     if asks_about_capabilities(prompt) or asks_about_previous_language(prompt):
+        return "normal"
+    if explicit_requested_language(prompt) is not None:
         return "normal"
     # Never send Croatian multiword requests through the minimal greeting
     # model on the strength of a language-agnostic length threshold alone.
@@ -86,6 +97,37 @@ def classify_request(prompt: str, *, workspace_active: bool = False,
     return "normal"
 
 
+_EXPLICIT_LANGUAGE_REQUESTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("French", re.compile(r"\b(?:r[eé]ponds?|r[eé]pondez|parle|[eé]cris)\b.{0,60}\bfran[cç]ais\b", re.I | re.S)),
+    ("German", re.compile(r"\b(?:antworte|ntworte|schreibe|sprich|wechsle)\b.{0,60}\b(?:deutsch|auf\s+deutsch)\b", re.I | re.S)),
+    ("Croatian", re.compile(r"\b(?:odgovaraj|odgovori|pi[šs]i|govori)\b.{0,60}\bhrvatsk\w*\b", re.I | re.S)),
+    ("Italian", re.compile(r"\b(?:rispondi|scrivi|parla)\b.{0,60}\bitalian\w*\b", re.I | re.S)),
+    ("Spanish", re.compile(r"\b(?:responde|escribe|habla)\b.{0,60}\bespa[nñ]ol\b", re.I | re.S)),
+    ("Portuguese", re.compile(r"\b(?:responde|escreve|fala)\b.{0,60}\bportugu[eê]s\b", re.I | re.S)),
+    ("Arabic", re.compile(r"(?:أجب|اجب|اكتب|تحدث).{0,60}(?:العربية|باللغة\s+العربية)", re.S)),
+    ("English", re.compile(r"\b(?:answer|reply|write|speak)\b.{0,60}\benglish\b", re.I | re.S)),
+)
+
+
+def explicit_requested_language(prompt: str) -> str | None:
+    value = str(prompt or "")
+    for language, pattern in _EXPLICIT_LANGUAGE_REQUESTS:
+        if pattern.search(value):
+            return language
+    # Explicit language names in natural instructions (not inferred from UI
+    # locale or generic words) may be routed independently. Unknown languages
+    # abstain and are never asserted as qualified.
+    contract = parse_mission_contract(value)
+    if contract.language is not None and (contract.sentence_count is not None or contract.identity_request):
+        return {
+            'en': 'English', 'fr': 'French', 'de': 'German', 'ar': 'Arabic',
+            'pt': 'Portuguese', 'es': 'Spanish', 'hr': 'Croatian', 'it': 'Italian',
+            'zh': 'Chinese', 'ja': 'Japanese', 'hi': 'Hindi',
+            'tr': 'Turkish', 'sw': 'Swahili', 'ru': 'Russian',
+        }.get(contract.language)
+    return None
+
+
 def response_language_hint(prompt: str, ui_language: str | None) -> str:
     """Use reliable language cues, then the selected UI language.
 
@@ -96,9 +138,25 @@ def response_language_hint(prompt: str, ui_language: str | None) -> str:
     """
     ui = (ui_language or "").lower()[:2]
     names = {"fr": "French", "en": "English", "de": "German", "ar": "Arabic",
-             "pt": "Portuguese", "es": "Spanish", "hr": "Croatian", "it": "Italian"}
+             "pt": "Portuguese", "es": "Spanish", "hr": "Croatian", "it": "Italian",
+             "zh": "Chinese", "ja": "Japanese", "hi": "Hindi", "tr": "Turkish",
+             "sw": "Swahili", "ru": "Russian"}
+    explicit = explicit_requested_language(prompt)
+    if explicit is not None:
+        return explicit
     if _LANGUAGE_AR.search(prompt):
         return "Arabic"
+    # P0.4.3c1-FIXED3: conservative current-turn cues for all eight UI
+    # languages.  Fullmatch prevents incidental quotations, code snippets or
+    # one foreign word inside an unrelated long prompt from rerouting it.
+    # This is NOT statistical language identification or fluency evidence.
+    for language, pattern in _HIGH_CONFIDENCE_TURN_CUES:
+        if pattern.fullmatch(str(prompt or "").strip()):
+            return language
+    # P0.4.3c1: current explicit Croatian/German utterance beats UI locale.
+    # These bounded high-confidence cues are not general language detection.
+    if _HR_CURRENT_UTTERANCE.search(prompt):
+        return "Croatian"
     if (_FRENCH_CAPABILITY.search(prompt)
             or re.search(r"\b(?:bonjour|salut|merci|pourquoi|comment|"
                          r"quelles?|r[eé]ponds?|explique|décris|aide[- ]moi)\b",
@@ -124,8 +182,46 @@ def response_language_hint(prompt: str, ui_language: str | None) -> str:
 
 _FRENCH_CAPABILITY = re.compile(
     r"\b(?:qu['’]es{1,2}t[- ]ce\s+que|tu\s+peux|peux[- ]tu|vous\s+pouvez|pouvez[- ]vous)\b", re.I)
+_HR_CURRENT_UTTERANCE = re.compile(
+    r"^\s*(?:(?:dobar\s+dan|dobro\s+jutro|dobra\s+ve[cč]er|"
+    r"laku\s+no[cć]|bok|pozdrav)[!?.\s]*|"
+    r"(?:[šs]ta|[šs]to)\s+(?:sve\s+)?mo[žz]e[šs]\s+(?:raditi|napraviti)[!?.\s]*|"
+    r"(?:tko|ko)\s+si(?:\s+ti)?[!?.\s]*)$", re.I,
+)
+# These cues only target high-confidence common user turns. Unknown requests
+# continue through the existing hints/UI fallback; an ordinary match must
+# never grant qualification or override runtime/model locality restrictions.
+_HIGH_CONFIDENCE_TURN_CUES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("English", re.compile(
+        r"(?:good\s+(?:morning|afternoon|evening)|hello|hi|thank\s+you|thanks|"
+        r"who\s+are\s+you|what\s+can\s+you\s+do)[!?.\s]*", re.I)),
+    ("French", re.compile(
+        r"(?:bonjour|bonsoir|salut|merci(?:\s+beaucoup)?|"
+        r"qui\s+es[- ]tu|qui\s+[eê]tes[- ]vous|"
+        r"que\s+peux[- ]tu\s+faire|que\s+pouvez[- ]vous\s+faire)[!?.\s]*", re.I)),
+    ("German", re.compile(
+        r"(?:guten\s+(?:morgen|tag|abend)|hallo|"
+        r"vielen\s+dank|danke(?:\s+sch[oö]n)?|"
+        r"wer\s+bist\s+du|was\s+kannst\s+du\s+(?:tun|machen))[!?.\s]*", re.I)),
+    ("Portuguese", re.compile(
+        r"(?:bom\s+dia|boa\s+(?:tarde|noite)|ol[aá]|"
+        r"muito\s+obrigad[oa]|quem\s+(?:[eé]s\s+tu|[eé]\s+voc[eê])|"
+        r"o\s+que\s+(?:voc[eê]\s+pode|podes)\s+fazer)[!?.\s]*", re.I)),
+    ("Spanish", re.compile(
+        r"[¿¡]?(?:buenos\s+d[ií]as|buenas\s+(?:tardes|noches)|hola|"
+        r"muchas\s+gracias|qui[eé]n\s+eres|"
+        r"qu[eé]\s+puedes\s+hacer)[!?.\s]*", re.I)),
+    ("Croatian", re.compile(
+        r"(?:dobar\s+dan|dobro\s+jutro|dobra\s+ve[cč]er|bok|pozdrav|"
+        r"hvala(?:\s+lijepa)?|(?:tko|ko)\s+si(?:\s+ti)?|"
+        r"(?:[šs]to|[šs]ta)\s+(?:sve\s+)?mo[žz]e[šs]\s+"
+        r"(?:raditi|napraviti))[!?.\s]*", re.I)),
+    ("Italian", re.compile(
+        r"(?:buongiorno|buonasera|ciao|grazie(?:\s+mille)?|"
+        r"chi\s+sei|cosa\s+(?:puoi|sai)\s+fare)[!?.\s]*", re.I)),
+)
 _LANGUAGE_AR = re.compile(r"[\u0600-\u06ff]")
-_LANGUAGE_DE = re.compile(r"\b(?:was\s+kannst\s+du|hallo|danke|warum)\b", re.I)
+_LANGUAGE_DE = re.compile(r"\b(?:wer\s+bist\s+du|wie\s+hei[ßs]t\s+du|was\s+kannst\s+du|hallo|danke|warum)\b", re.I)
 _LANGUAGE_IT = re.compile(r"\b(?:cosa\s+(?:sai|puoi)\s+fare|ciao|grazie)\b", re.I)
 _LANGUAGE_ES = re.compile(r"\b(?:qu[eé]\s+puedes\s+hacer|hola|gracias)\b", re.I)
 _LANGUAGE_PT = re.compile(r"\b(?:o\s+que\s+(?:podes|consegues|voc[eê]\s+pode)\s+fazer|ol[aá]|obrigad[oa])\b", re.I)
@@ -276,7 +372,9 @@ def _caps(descriptor: Any) -> set[str]:
 
 
 _LANG_CODES = {"French": "fr", "English": "en", "Croatian": "hr", "German": "de",
-               "Italian": "it", "Spanish": "es", "Portuguese": "pt", "Arabic": "ar"}
+               "Italian": "it", "Spanish": "es", "Portuguese": "pt", "Arabic": "ar",
+               "Chinese": "zh", "Japanese": "ja", "Hindi": "hi", "Turkish": "tr",
+               "Swahili": "sw", "Russian": "ru"}
 
 
 def _language_code(prompt: str, ui_language: str | None) -> str:
@@ -516,20 +614,99 @@ def _qualified_fallback(registry: Any, current_resource_id: str, *,
     return str(chosen.resource_id)
 
 
+_LANGUAGE_TRIAL_CODES = frozenset({'fr', 'en', 'hr', 'de', 'it', 'es', 'pt', 'ar'})
+
+
+def _provisional_language_fallback(registry: Any, current_resource_id: str, *,
+                                   task_class: str, language: str,
+                                   remaining_seconds: float | None) -> str | None:
+    """Choose ONE local evidence-building recovery trial after a language-contract failure.
+
+    This is deliberately weaker than qualification: it never declares fluency.
+    It is only used inside the existing single quality-retry budget after the
+    current model has already produced an objectively rejected answer for an
+    explicitly requested language.  Known same-language failures are avoided;
+    if all alternatives are unmeasured, prefer the smallest local model larger
+    than the failed incumbent as a bounded capacity escalation.
+    """
+    if task_class not in {'quick', 'normal'} or language not in _LANGUAGE_TRIAL_CODES:
+        return None
+    if remaining_seconds is not None and remaining_seconds <= 0:
+        return None
+    descriptors = [d for d in _eligible(registry, task_class)
+                   if getattr(d, 'local', None) is True]
+    current = next((d for d in descriptors
+                    if str(getattr(d, 'resource_id', '')) == current_resource_id), None)
+    current_size = _size_bytes(current) if current is not None else 0
+    rows: list[tuple[Any, Any, Any]] = []
+    for d in descriptors:
+        rid = str(getattr(d, 'resource_id', ''))
+        if not rid or rid == current_resource_id:
+            continue
+        q = qualification(rid, task_class, language)
+        cross = task_qualification(rid, task_class)
+        # Do not repeatedly gamble on a model with only negative evidence in
+        # this language. A prior accepted turn remains usable but unproven.
+        if q.attempts and q.accepted == 0:
+            continue
+        if remaining_seconds is not None and q.p95_ms is not None:
+            if q.p95_ms / 1000 + .5 >= remaining_seconds:
+                continue
+        rows.append((d, q, cross))
+    if not rows:
+        return None
+
+    same_language_positive = [row for row in rows if row[1].accepted > 0]
+    if same_language_positive:
+        rows = same_language_positive
+    else:
+        cross_proven = [row for row in rows if row[2].qualified]
+        if cross_proven:
+            rows = cross_proven
+        elif current_size:
+            larger = [row for row in rows if _size_bytes(row[0]) > current_size]
+            if larger:
+                # Bounded escalation: do not jump straight to the heaviest
+                # model when a closer local capacity step exists.
+                next_size = min(_size_bytes(row[0]) for row in larger)
+                rows = [row for row in larger if _size_bytes(row[0]) == next_size]
+
+    def key(row: tuple[Any, Any, Any]):
+        d, q, cross = row
+        size = _size_bytes(d)
+        return (
+            -(q.accepted),
+            -(cross.accepted),
+            q.rejected + q.timed_out,
+            size if size else 2**63 - 1,
+            hashlib.blake2s(str(d.resource_id).encode(), digest_size=8).digest(),
+        )
+    return str(min(rows, key=key)[0].resource_id)
+
+
 def choose_quality_fallback(registry: Any, current_resource_id: str,
                             conversation_root: Path | None = None,
                             *, task_class: str = 'normal', language: str = 'en',
                             remaining_seconds: float | None = None,
-                            semantic_subtask: str | None = None) -> str | None:
-    """Only a separately qualified same-language resource may replace a rejected answer.
+                            semantic_subtask: str | None = None,
+                            allow_provisional_language_trial: bool = False) -> str | None:
+    """Choose a governed local fallback after a rejected answer.
 
-    For locally provable DIRECT subtasks, a candidate with deterministic
-    semantic failures is excluded and a positively proven candidate is
-    preferred. Unknown candidates remain bounded operational fallbacks.
+    Qualified same-language evidence always wins.  For an explicit language
+    request only, one unqualified LOCAL recovery trial may be selected when no
+    qualified alternative exists.  The trial does not certify language skill;
+    its output must pass the same response/shape guards and its real outcome is
+    then recorded by the existing qualification machinery.
     """
-    return _qualified_fallback(registry, current_resource_id, task_class=task_class,
-                               language=language, remaining_seconds=remaining_seconds,
-                               prompt='quality_retry', semantic_subtask=semantic_subtask)
+    qualified = _qualified_fallback(
+        registry, current_resource_id, task_class=task_class, language=language,
+        remaining_seconds=remaining_seconds, prompt='quality_retry',
+        semantic_subtask=semantic_subtask)
+    if qualified is not None or not allow_provisional_language_trial:
+        return qualified
+    return _provisional_language_fallback(
+        registry, current_resource_id, task_class=task_class, language=language,
+        remaining_seconds=remaining_seconds)
 
 
 def choose_timeout_fallback(registry: Any, current_resource_id: str,

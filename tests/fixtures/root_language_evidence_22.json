@@ -1,0 +1,112 @@
+[
+  {
+    "prompt": "Introduce yourself as MAESTRO in exactly two natural English sentences. State where you run and what you can really do, without inventing abilities.",
+    "output": "MAESTRO is an AI language model that runs on this computer. I can understand and generate human-like text, respond to questions, and engage in discussions. I am capable of generating and editing natural language sentences, performing text analysis, and generating creative content. I can also interact with users in text-based conversation, helping with a wide range of tasks and providing assistance.",
+    "language": "en"
+  },
+  {
+    "prompt": "Explain in one natural English sentence what running locally on a computer means, without claiming Internet access.",
+    "output": "Running locally on a computer means using the computer's internal storage to run applications and programs.",
+    "language": "en"
+  },
+  {
+    "prompt": "Présente-toi en tant que MAESTRO en exactement deux phrases françaises naturelles. Explique où tu fonctionnes et ce que tu peux réellement faire, sans inventer de capacités.",
+    "output": "Je suis une intelligence artificielle installée sur ce ordinateur et je peux répondre à vos questions et vous aider dans vos recherches. Je peux vous fournir des informations précises et à jour sur un large éventail de sujets, mais je suis limité à l'acquisition et à la manipulation de données existantes.",
+    "language": "fr"
+  },
+  {
+    "prompt": "Explique en une seule phrase française naturelle ce que signifie fonctionner localement sur un ordinateur, sans prétendre accéder à Internet.",
+    "output": "Fonctionner localement sur un ordinateur signifie qu'éventuellement je peux utiliser l'ordinateur pour stocker et rechercher des informations sur ses disques dur ou de son système de fichiers, sans avoir accès à Internet.",
+    "language": "fr"
+  },
+  {
+    "prompt": "Stelle dich als MAESTRO in genau zwei natürlichen deutschen Sätzen vor. Erkläre, wo du arbeitest und was du tatsächlich tun kannst, ohne Fähigkeiten zu erfinden.",
+    "output": "Ich bin MAESTRO, Ihr lokaler KI-Assistent auf diesem Computer, der hier zur Verfügung steht, um Ihnen bei der Suche nach Informationen, beim Schreiben von Texten, der Bearbeitung von Dateien und der Beantwortung Ihrer Fragen zu helfen. Ich kann ohne besondere Fähigkeiten im Bereich Musik oder Programmierung Aufgaben wie die Texterkennung, Übersetzungen und die Analyse von Dateien durchführen.",
+    "language": "de"
+  },
+  {
+    "prompt": "Erkläre in genau einem natürlichen deutschen Satz, was lokale Ausführung auf einem Computer bedeutet, ohne Internetzugang zu behaupten.",
+    "output": "Locale Ausführung bedeutet, dass ich auf diesem Computer direkt von den Daten und Anweisungen der installierten Software und Programmiersprachen ausgeführt werde, ohne auf das Internet zugreifen zu müssen.",
+    "language": "de"
+  },
+  {
+    "prompt": "عرّف بنفسك بصفتك MAESTRO في جملتين عربيتين فصيحتين وطبيعيتين. وضّح أين تعمل وما تستطيع فعله حقًا دون اختلاق قدرات.",
+    "output": "أنا مساعد ذكاء اصطناعي محلي على هذا الحاسوب، أُنشئ من مجموعة متنوعة من الأطراف والمنصات لتحسين أداء الهواتف الذكية وتحسينات اللازمة على أداء الخدمات المحمولة.\nأنا لا أستطيع الاستجابة للأسئلة أو الملاحظات التي يركز عليها المستخدم.",
+    "language": "ar"
+  },
+  {
+    "prompt": "اشرح في جملة عربية فصيحة واحدة معنى تشغيل مساعد ذكاء اصطناعي محلي على الحاسوب دون الادعاء بامتلاك اتصال بالإنترنت.",
+    "output": "أعتذر، لكنني لا أستطيع تنفيذ هذا المطلب بشكل صحيح.",
+    "language": "ar"
+  },
+  {
+    "prompt": "Apresenta-te como MAESTRO em exatamente duas frases naturais em português. Explica onde funcionas e o que realmente consegues fazer, sem inventar capacidades.",
+    "output": "",
+    "language": "pt"
+  },
+  {
+    "prompt": "Explica numa única frase natural em português o que significa funcionar localmente num computador, sem afirmar que tens acesso à Internet.",
+    "output": "Quando eu sou MAESTRO, eu opero diretamente no meu computador, sem precisar conectar-me a Internet.",
+    "language": "pt"
+  },
+  {
+    "prompt": "Preséntate como MAESTRO en exactamente dos frases naturales en español. Explica dónde funcionas y qué puedes hacer realmente, sin inventar capacidades.",
+    "output": "",
+    "language": "es"
+  },
+  {
+    "prompt": "Explica en una sola frase natural en español qué significa funcionar localmente en un ordenador, sin afirmar que tienes acceso a Internet.",
+    "output": "MAESTRO se refiere a un sistema de inteligencia artificial localmente instalado en un ordenador, no conectado a Internet.",
+    "language": "es"
+  },
+  {
+    "prompt": "Predstavi se kao MAESTRO u točno dvije prirodne hrvatske rečenice. Objasni gdje radiš i što doista možeš učiniti, bez izmišljanja mogućnosti.",
+    "output": "",
+    "language": "hr"
+  },
+  {
+    "prompt": "Objasni u jednoj prirodnoj hrvatskoj rečenici što znači lokalni rad na računalu, bez tvrdnje da imaš pristup internetu.",
+    "output": "Local work on a computer, without internet access.",
+    "language": "hr"
+  },
+  {
+    "prompt": "Presentati come MAESTRO in esattamente due frasi naturali in italiano. Spiega dove funzioni e cosa puoi davvero fare, senza inventare capacità.",
+    "output": "",
+    "language": "it"
+  },
+  {
+    "prompt": "Spiega in una sola frase naturale in italiano cosa significa funzionare localmente su un computer, senza affermare di avere accesso a Internet.",
+    "output": "MAESTRO funziona localmente sul tuo computer.",
+    "language": "it"
+  },
+  {
+    "prompt": "请用自然的中文写恰好两句话，介绍本地人工智能助手 MAESTRO，并说明它在什么设备上运行。不要编造功能。",
+    "output": "MAESTRO 是一个本地人工智能助手，可以在手机、电脑或平板电脑等设备上运行。",
+    "language": "zh"
+  },
+  {
+    "prompt": "自然な日本語の文をちょうど二つ使って、ローカルAIアシスタントMAESTROと動作する場所を説明してください。能力を作り話にしないでください。",
+    "output": "MAESTROは、あなたのPCやスマートフォンにインストールして使用できます。これはローカルAIアシスタントの一つとして、あなたにさまざまな言語と知識を提供し、あなたの質問に答えます。",
+    "language": "ja"
+  },
+  {
+    "prompt": "स्वाभाविक हिंदी में ठीक दो वाक्यों में स्थानीय एआई सहायक MAESTRO का परिचय दें और बताएं कि यह कहाँ चलता है। क्षमताएँ न गढ़ें।",
+    "output": "Sure, I can help you with that. Let's start with the first example. The word \"हिंदी\" means Hindi in English. So, a correct translation of \"हिंदी में\" would be \"in Hindi.\" Now, for the second example, the word \"ठीक\" means correct. So, a correct translation of \"ठीक दो वाक्यों\" would be \"two correct sentences.\" And finally, for the phrase \"में स्थानीय एआई सहायक MAESTRO\", the correct translation would be \"as a local AI assistant on this computer.\"",
+    "language": "hi"
+  },
+  {
+    "prompt": "Doğal Türkçeyle tam iki cümlede MAESTRO adlı yerel yapay zekâ asistanını ve nerede çalıştığını açıklayın. Yetenek uydurmayın.",
+    "output": "",
+    "language": "tr"
+  },
+  {
+    "prompt": "Kwa Kiswahili sanifu, andika sentensi mbili tu kuhusu msaidizi wa AI wa ndani anayeitwa MAESTRO na mahali anapofanya kazi. Usibuni uwezo.",
+    "output": "Wata kuwa kwa Kiswahili. Usabuni uwezo.",
+    "language": "sw"
+  },
+  {
+    "prompt": "На естественном русском языке в двух предложениях представь локального ИИ-помощника MAESTRO и укажи, где он работает. Не придумывай возможности.",
+    "output": "MAESTRO работает на компьютере.",
+    "language": "ru"
+  }
+]

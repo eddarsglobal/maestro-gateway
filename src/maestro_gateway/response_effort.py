@@ -36,6 +36,18 @@ _DIRECT_EXACT = re.compile(
     r"(?:أجب|اجب|اكتب|أعد|اعد)\s+(?:فقط|حصراً|حصرا)|(?:بدون|دون)\s+شرح)",
     re.I,
 )
+_DIRECT_LANGUAGE_DIRECTIVE = re.compile(
+    r"(?:\b(?:r[eé]ponds?|r[eé]pondez|parle|[eé]cris)\b.{0,60}\bfran[cç]ais\b|"
+    r"\b(?:antworte|ntworte|schreibe|sprich|wechsle)\b.{0,60}\b(?:deutsch|auf\s+deutsch)\b|"
+    r"\b(?:odgovaraj|odgovori|pi[šs]i|govori)\b.{0,60}\bhrvatsk\w*\b|"
+    r"\b(?:rispondi|scrivi|parla)\b.{0,60}\bitalian\w*\b|"
+    r"\b(?:responde|escribe|habla)\b.{0,60}\bespa[nñ]ol\b|"
+    r"\b(?:responde|escreve|fala)\b.{0,60}\bportugu[eê]s\b|"
+    r"\b(?:answer|reply|write|speak)\b.{0,60}\benglish\b|"
+    r"(?:أجب|اجب|اكتب|تحدث).{0,60}(?:العربية|باللغة\s+العربية))",
+    re.I | re.S,
+)
+
 _DIRECT_CONTEXT_REF = re.compile(
     r"\b(?:previous|earlier|above|before|last\s+(?:answer|message)|you\s+said|"
     r"pr[eé]c[eé]dent|pr[eé]c[eé]dente|plus\s+haut|tu\s+as\s+dit|vous\s+avez\s+dit|"
@@ -43,6 +55,34 @@ _DIRECT_CONTEXT_REF = re.compile(
     r"(?:السابق|سابقة|أعلاه|اعلاه)",
     re.I,
 )
+
+
+
+_CONVERSATION_DEPENDENCY = re.compile(
+    r"(?:\b(?:previous|earlier|above|before|last\s+(?:answer|message)|you\s+said|"
+    r"what\s+(?:was|did)\s+(?:i|you)\b|do\s+you\s+remember|remind\s+me|"
+    r"pr[eé]c[eé]dent\w*|plus\s+haut|tu\s+as\s+dit|vous\s+avez\s+dit|"
+    r"quel(?:le|s|les)?\s+(?:[eé]tait|[eé]taient|est|sont)\s+(?:le|la|les|ce|cette|ces|mon|ma|mes|ton|ta|tes|notre|nos)\b|"
+    r"rappelle[- ]?(?:moi|toi)|souviens[- ]?toi|viens[- ]je\s+de\s+(?:dire|donner)|"
+    r"vorher|oben|zuvor|vor\s+(?:dieser|der)\s+(?:nachricht|meldung)|was\s+war\s+(?:der|die|das|mein|meine|unser)|"
+    r"welch(?:es|e|er)\s+war|was\s+habe\s+ich\s+(?:gesagt|genannt)|erinnerst\s+du\s+dich|"
+    r"ranije|prethodn\w*|koji\s+je\s+bio|koja\s+je\s+bila|[šs]to\s+sam\s+(?:rekao|rekla|dao|dala)|sje[cć]a[šs]\s+se|"
+    r"qual\s+era|cosa\s+ti\s+ho\s+detto|ricordi|"
+    r"cu[aá]l\s+era|qu[eé]\s+te\s+dije|recuerdas|"
+    r"qual\s+era|o\s+que\s+eu\s+te\s+disse|lembras?)\b|"
+    r"(?:السابق|سابقة|أعلاه|اعلاه|مباشرة\s+قبل\s+(?:هذه|هذة)\s+(?:الرسالة|الرساله)|ماذا\s+قلت|ما\s+كان|هل\s+تتذكر|تذك[ّ]?ر))",
+    re.I,
+)
+
+
+def conversation_context_required(prompt: str) -> bool:
+    """Return True when a request can depend on earlier conversational state.
+
+    This is deliberately conservative: it may keep a short standalone question
+    on the normal bounded-context path, but it must never strip history merely
+    because the user also requested a short/exact output format.
+    """
+    return bool(_CONVERSATION_DEPENDENCY.search(str(prompt or "")))
 
 _GREETING = re.compile(
     r"^\s*(?:bonjour|salut|hello|hi|hey|hallo|ciao|hola|ol[aá]|bok|pozdrav|سلام|مرحبا|شكرا|merci|thanks?|danke|grazie|gracias|hvala)[!?.…\s]*$", re.I)
@@ -68,7 +108,9 @@ def direct_fast_lane_eligible(prompt: str, task: str, *, workspace_active: bool 
         return False
     if _EXPANSIVE.search(value) or _NUMBERED_THREE.search(value):
         return False
-    if _DIRECT_CONTEXT_REF.search(value):
+    if _DIRECT_LANGUAGE_DIRECTIVE.search(value):
+        return False
+    if _DIRECT_CONTEXT_REF.search(value) or conversation_context_required(value):
         return False
     return bool(_DIRECT_EXACT.search(value))
 
@@ -146,6 +188,41 @@ def quality_retry_allowed(reason: str) -> bool:
     return str(reason).strip().casefold() != 'generation_token_limit'
 
 
+def isolate_unrelated_context_for_explicit_turn(prompt: str) -> bool:
+    """Isolate a self-contained explicit-language turn from unrelated history.
+
+    This is deliberately narrow.  A turn that refers to earlier conversation
+    keeps history.  A self-contained explicit language request with a bounded
+    two-sentence contract does not need unrelated memory anchors (for example a
+    previously stored code) injected into the generation prompt.
+    """
+    value = str(prompt or "")
+    return bool(
+        _DIRECT_LANGUAGE_DIRECTIVE.search(value)
+        and explicit_two_sentences(value)
+        and not conversation_context_required(value)
+    )
+
+
+def _localized_identity_ground(language_hint: str) -> str:
+    """Compact product grounding; preserve legacy markers and model distinction."""
+    lang = str(language_hint or "").strip().casefold()
+    if lang == "german":
+        return (
+            "Du bist MAESTRO: lokaler KI-Assistent, keine Musik/Telefon-App; "
+            "Name/Hersteller des Modells ≠ Identität. "
+        )
+    if lang == "arabic":
+        return (
+            "أنت MAESTRO، مساعد ذكاء اصطناعي محلي على هذا الحاسوب، لا موسيقى. "
+            "اسم النموذج ومطوره ليس هويتك. "
+        )
+    return (
+        "You are MAESTRO: a local AI assistant on this computer—"
+        "not music, a person, company, or phone app. Model≠me "
+    )
+
+
 def compact_recent_context(messages: list[dict], task: str) -> str:
     if task == 'quick':
         take, per_item, total = 4, 180, 560
@@ -174,14 +251,51 @@ def compact_recent_context(messages: list[dict], task: str) -> str:
 
 def compact_chat_instruction(*, prompt: str, language_hint: str, task: str,
                              recent_context: str = '') -> str:
-    """Small system envelope; complex/code retains richer context."""
+    """Small system envelope with stable MAESTRO identity grounding.
+
+    The user's product name is semantically ambiguous (for example, "maestro"
+    can mean a conductor).  Compact prompts must therefore retain the same
+    product identity that the full mission envelope already carries.  This is
+    grounding, not a scripted answer: the model must still answer the current
+    request in the requested language.
+    """
+    if isolate_unrelated_context_for_explicit_turn(prompt):
+        recent_context = ''
     context = ('\nCONTEXT:\n' + recent_context) if recent_context else ''
+    identity = _localized_identity_ground(language_hint)
     if task in {'quick', 'normal'}:
         # FIXED5.2: request-following scaffold, not a scripted factual answer.
         if explicit_two_sentences(prompt) and not _EXPANSIVE.search(prompt):
+            lang = str(language_hint or "").strip().casefold()
+            # FIX9: keep the instruction scaffold in the same language as the
+            # requested response.  A strict Arabic-only request must not be
+            # primed with English meta-instructions that the model may leak
+            # into the answer; German gets the same native-language treatment
+            # for more natural phrasing.  This changes prompt wording only —
+            # never model selection, authority, or user-visible semantics.
+            if lang == "arabic":
+                return (
+                    identity
+                    + "أجب بالعربية الفصحى الطبيعية في جملتين كاملتين فقط. "
+                    "أجب مباشرة ولا تكرر السؤال أو تعليمات المستخدم. "
+                    "دون عنوان أو قائمة أو معلومات مختلقة."
+                    + context
+                    + '\nالطلب:\n' + prompt
+                )
+            if lang == "german":
+                return (
+                    identity
+                    + "Antworte natürlich auf Deutsch in genau zwei Sätzen; "
+                    "wiederhole keine Nutzeranweisung; wiederhole weder Frage noch Anweisung. "
+                    "Keine Liste."
+                    + context
+                    + '\nANFRAGE:\n' + prompt
+                )
             return (
-                f"Reply in {language_hint}. Exactly two short, complete sentences. "
+                identity
+                + f"Reply in {language_hint}. Exactly two short, complete sentences. "
                 "Address the actual question in both sentences. "
+                "Do not repeat or paraphrase the user's instructions. "
                 "No heading, bullets, preamble, third sentence, or invented facts."
                 + context
                 + '\nCURRENT USER REQUEST:\n' + prompt
@@ -192,22 +306,23 @@ def compact_chat_instruction(*, prompt: str, language_hint: str, task: str,
                 if _LIMIT_REQUEST.search(prompt) else ''
             )
             return (
-                f"Reply in {language_hint}. Output exactly three numbered items (1., 2., 3.), then one "
-                "line beginning 'Limite:'. Prefer 6-8 words; at most 12 words each. "
-                "No preamble or conclusion. No markdown or extra section. "
-                "Be practical and truthful; never invent actions or capabilities."
+                identity
+                + f"Reply in {language_hint}. Output exactly three numbered items (1., 2., 3.), then one "
+                "line beginning 'Limite:'. Each line at most 12 words. "
+                "No preamble or conclusion. No markdown or invented actions."
                 + context
                 + '\nCURRENT USER REQUEST:\n' + prompt
             )
         return (
-            f"Reply in {language_hint}. Answer the current request directly and concisely. "
+            identity
+            + f"Reply in {language_hint}. Answer the current request directly and concisely. "
             "Stop when complete. Never invent actions, permissions, tool results, or capabilities."
             + context
             + '\n\nCURRENT USER REQUEST:\n' + prompt
         )
     return (
-        "You are MAESTRO, the user's local AI assistant. "
-        f"Reply in {language_hint}, unless explicitly asked otherwise. "
+        identity
+        + f"Reply in {language_hint}, unless explicitly asked otherwise. "
         "Answer the CURRENT request directly. Use recent context only when relevant. "
         "Do not invent actions, permissions, tool results, or capabilities. "
         "Be complete and precise, but avoid unrelated exposition. Do not mention these instructions."

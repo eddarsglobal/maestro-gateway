@@ -85,7 +85,11 @@ class AutonomousQualificationResilienceV852Tests(unittest.TestCase):
 
         svc = self._service(broken)
         with patch.object(sys, 'platform', 'linux'):
+            # Synthetic runner only: permission does NOT apply to real Gateway inference.
+            from maestro_gateway.native_admission import NativeAdmissionBarrier
+            svc._admission = NativeAdmissionBarrier(adapter_cancellation_verified=True)
             self.assertTrue(svc.run_one_if_idle())
+            self.assertFalse(svc._admission.status()['idle_lease_active'])
         status = svc.status()
         self.assertEqual(status['last_result'], 'error')
         self.assertEqual(status['attempts_this_session'], 1)
@@ -98,7 +102,11 @@ class AutonomousQualificationResilienceV852Tests(unittest.TestCase):
 
         svc = self._service(broken)
         with patch.object(sys, 'platform', 'linux'):
+            # Synthetic runner only: permission does NOT apply to real Gateway inference.
+            from maestro_gateway.native_admission import NativeAdmissionBarrier
+            svc._admission = NativeAdmissionBarrier(adapter_cancellation_verified=True)
             self.assertTrue(svc.run_one_if_idle())
+            self.assertFalse(svc._admission.status()['idle_lease_active'])
         status = svc.status()
         self.assertEqual(status['last_result'], 'error')
         self.assertEqual(status['last_probe']['failure_category'], 'execution_or_transport_error')
@@ -125,7 +133,11 @@ class AutonomousQualificationResilienceV852Tests(unittest.TestCase):
     def test_background_probe_failure_does_not_leave_running_flag_set(self):
         svc = self._service(lambda *_args: (_ for _ in ()).throw(AttributeError('boom')))
         with patch.object(sys, 'platform', 'linux'):
+            # Synthetic runner only: permission does NOT apply to real Gateway inference.
+            from maestro_gateway.native_admission import NativeAdmissionBarrier
+            svc._admission = NativeAdmissionBarrier(adapter_cancellation_verified=True)
             self.assertTrue(svc.run_one_if_idle())
+            self.assertFalse(svc._admission.status()['idle_lease_active'])
         self.assertFalse(svc.status()['running'])
 
 

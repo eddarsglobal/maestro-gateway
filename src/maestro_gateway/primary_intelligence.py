@@ -1,11 +1,12 @@
 """Sovereign single-primary local inference policy, subordinate to the Core.
 
 Only one primary conversational model is selected at once. The manager owns NO
-model execution, credentials or file writes and cannot grant permissions. It
+model execution or credentials and cannot grant permissions. P0.4.1 adds
+owner-only post-verdict local evidence writes, not new model execution. It
 selects from the Core's already-authorized local resource descriptors. An
 explicit user model selection remains a separate, governed per-call override.
 
-The first selection and subsequent decisions use in-memory evidence only.
+Routing decisions remain in-memory; the durable registry is observational only.
 Failures or stale resource removal may trigger an autonomous, atomic switch;
 models are NEVER installed, started or routed to a cloud service here.
 """
@@ -19,10 +20,13 @@ from typing import Any
 
 from .adaptive_router import (
     RouteDecision, choose_adaptive_resource, classify_request,
-    _language_code, _size_bytes,
+    _language_code, _size_bytes, explicit_requested_language,
 )
-from .model_qualification import qualification, task_qualification
+from .model_qualification import qualification, task_qualification, verified_version
+from .language_benchmark_evidence import preferred_language_resource
 from .semantic_competence import semantic_qualification
+from .language_quality_governor import SessionLanguageEvidence
+from .sovereign_evidence_ledger import SovereignEvidenceLedger, EvidenceUnavailable
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,11 @@ class PrimaryIntelligenceManager:
         # recovery trial per subtask/language/resource. This is evidence-driven
         # and provider-neutral; no model name is privileged.
         self._semantic_trials: set[tuple[str, str, str]] = set()
+        self._language_evidence = SessionLanguageEvidence()
+        # P0.4.1: durable attribution only. Never treat delivery as intelligence.
+        self._durable_evidence = SovereignEvidenceLedger()
+        # One authorized next-user-request trial per observed bad language model.
+        self._language_recovery_trials: set[tuple[str,str,str]] = set()
 
     @staticmethod
     def _eligible_local(registry: Any, task_class: str) -> dict[str, Any]:
@@ -98,6 +107,7 @@ class PrimaryIntelligenceManager:
         task = classify_request(prompt, workspace_active=workspace_active,
                                 ui_language=ui_language)
         language = _language_code(prompt, ui_language)
+        explicit_language = explicit_requested_language(prompt)
         with self._lock:
             now = time.monotonic()
             # A timeout is not proof that a model is permanently defective;
@@ -125,16 +135,69 @@ class PrimaryIntelligenceManager:
                 old = None
 
             # Select only when necessary; ordinary chat keeps its ONE primary.
-            # A model with real same-task/language evidence may replace an
-            # unqualified incumbent. This is competence-based, not brand-based.
+            # A user-authorized objective language benchmark may nominate a
+            # digest-bound PROVISIONAL candidate for an explicitly requested
+            # language.  This is not fluency certification and never bypasses
+            # the normal response guard / mission acceptance path.
             candidate = None
+            benchmark_candidate = (
+                preferred_language_resource(available.keys(), language, verified_version)
+                if explicit_language is not None else None
+            )
+            # FIX16-FIXED6: a *provisional* historic benchmark cannot override
+            # repeated failed real-language missions. No hidden model calls.
+            # Restrict trial to already-authorized, live local descriptors.
+            degraded = {
+                rid for rid in available
+                if self._language_evidence.should_trial_alternative(
+                    rid, language, verified_version(rid))
+            }
+            preferred_alternatives = {rid:d for rid,d in available.items()
+                                      if rid not in degraded}
+            language_recovery = (
+                explicit_language is not None and benchmark_candidate in degraded
+                and bool(preferred_alternatives)
+            )
+            if language_recovery:
+                benchmark_candidate = preferred_language_resource(
+                    preferred_alternatives.keys(), language, verified_version)
+                if benchmark_candidate is None:
+                    # Still PROVISIONAL. Use Core's existing evidence router,
+                    # never infer fluency and never change other language scopes.
+                    trial = choose_adaptive_resource(
+                        _RestrictedRegistry(preferred_alternatives.values()), prompt,
+                        workspace_active=workspace_active, max_tokens=max_tokens,
+                        ui_language=ui_language, cold_start=True)
+                    benchmark_candidate = trial.resource_id
+                # Guard against switching oscillations after a trial failed.
+                key=(benchmark_candidate,language,verified_version(benchmark_candidate) or '')
+                if key in self._language_recovery_trials:
+                    language_recovery=False
+                    benchmark_candidate=None
+                else:
+                    self._language_recovery_trials.add(key)
+            # Avoid reselecting a degraded benchmark just because it was fast.
+            if benchmark_candidate in degraded and preferred_alternatives:
+                benchmark_candidate=None
             if old is None:
-                candidate = choose_adaptive_resource(
-                    _RestrictedRegistry(available.values()), prompt,
-                    workspace_active=workspace_active, max_tokens=max_tokens,
-                    ui_language=ui_language, cold_start=True)
-                selected = candidate.resource_id
-                reason = "initial_selection" if self._primary is None else "resource_unavailable"
+                if benchmark_candidate is not None:
+                    selected = benchmark_candidate
+                    reason = "real_language_quality_recovery_trial" if language_recovery else "user_language_benchmark_evidence"
+                else:
+                    candidate = choose_adaptive_resource(
+                        _RestrictedRegistry(available.values()), prompt,
+                        workspace_active=workspace_active, max_tokens=max_tokens,
+                        ui_language=ui_language, cold_start=True)
+                    selected = candidate.resource_id
+                    reason = "initial_selection" if self._primary is None else "resource_unavailable"
+            elif benchmark_candidate is not None:
+                # FIX5: complete, digest-bound user benchmark evidence for an
+                # explicitly requested language earns one REAL first attempt.
+                # Generic historical task/language qualification must not
+                # displace it before that attempt; the normal response guard
+                # remains authoritative and may still reject/fail over it.
+                selected = benchmark_candidate
+                reason = "real_language_quality_recovery_trial" if language_recovery else "user_language_benchmark_evidence"
             else:
                 selected = old
                 reason = "primary_reused"
@@ -189,7 +252,9 @@ class PrimaryIntelligenceManager:
                     # language, reuse it once and let real current-language
                     # evidence decide. This avoids needless cold primary swaps.
                     language_only_unknown = (
-                        current_q.attempts == 0 and cross_language_q.accepted >= 1
+                        explicit_language is None
+                        and current_q.attempts == 0
+                        and cross_language_q.accepted >= 1
                     )
                     qualified = ({rid: d for rid, d in available.items()
                                   if rid != old and qualification(rid, task, language).qualified}
@@ -364,6 +429,45 @@ class PrimaryIntelligenceManager:
                 self._inference_proven = False
                 self._reason = "resource_disappeared"
 
+    def note_language_quality(self, resource_id: str, language: str,
+                              *, accepted: bool, quality_reason: str,
+                              expected_epoch: int) -> bool:
+        """Attribute one REAL mission result using CAS and the current digest.
+
+        A successful shape is not linguistic certification. Another thread's
+        completed mission may not mutate evidence for a replaced primary.
+        """
+        with self._lock:
+            if self._primary != resource_id or self._epoch != expected_epoch:
+                return False
+            return self._language_evidence.observe(
+                resource_id, language, verified_version(resource_id),
+                accepted=accepted, reason=quality_reason)
+
+    def note_sovereign_observation(self, resource_id: str, language: str,
+                                   task: str, status: str, receipt_id: str,
+                                   *, expected_epoch: int) -> str:
+        """Persist an actual committed primary mission without leaking content.
+
+        Stale epoch or versionless records are not attributed. An I/O failure
+        never mutates model selection, promotes a model, or invalidates an
+        already committed user-visible conversation.
+        """
+        with self._lock:
+            if self._primary != resource_id or self._epoch != expected_epoch:
+                return 'stale_primary_refused'
+            version = verified_version(resource_id)
+            if not isinstance(version, str) or len(version) < 16:
+                return 'unversioned_refused'
+            # Fixed-length opaque fingerprint; never store raw provider metadata.
+            digest = hashlib.sha256(version.encode('utf-8')).hexdigest()
+            try:
+                added = self._durable_evidence.record(
+                    resource_id, digest, language, task, status, receipt_id=receipt_id)
+            except (EvidenceUnavailable, OSError, ValueError, TypeError, KeyError) as exc:
+                return 'store_unavailable_' + type(exc).__name__
+            return 'recorded' if added else 'deduplicated'
+
     def note_success(self, resource_id: str, *, expected_epoch: int | None = None) -> bool:
         """Proof of one completed local conversation, not semantic qualification."""
         with self._lock:
@@ -378,7 +482,14 @@ class PrimaryIntelligenceManager:
                     "epoch": self._epoch, "reason": self._reason,
                     "cloud_enabled": False, "primary_selected": self._primary is not None,
                     "inference_ready": self._inference_proven,
-                    "cooling_down_models": len(self._quarantine)}
+                    "cooling_down_models": len(self._quarantine),
+                    "language_quality_evidence": self._language_evidence.snapshot(),
+                    "current_primary_language_evidence": (
+                        self._language_evidence.scoped_snapshot(
+                            self._primary, verified_version(self._primary))
+                        if self._primary is not None else
+                        {'version_bound': False, 'languages': {}, 'fluency_certified': False}
+                    )}
 
 
 class _RestrictedRegistry:

@@ -11,7 +11,10 @@ from dataclasses import dataclass
 import math
 import operator
 import re
+import unicodedata
 from typing import Any
+
+from .symbolic_task_prover import prove_symbolic_task
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +48,86 @@ _ARITH = re.compile(
     r"(?P<expr>[-+*/%()\d\s.]{3,80})",
     re.I,
 )
+# SIQ-P0.2: conservative, language-aware *intent* detection surrounding a
+# language-independent arithmetic AST. A locally proved expression must not be
+# left to a weak language model merely because the imperative is non-English.
+# Supported surface forms are auditable and extensible; unknown forms ABSTAIN.
+# This is not a multilingual grammar or natural-language semantics evaluator.
+_SIQ_MATH_PREFIX = re.compile(
+    r"^\s*(?:calculate|compute|calcule|calculer|berechne|"
+    r"calcola|calcula|izračunaj|izracunaj|احسب|计算|"
+    r"hesabu|вычисли|вычислите)\s+", re.I
+)
+_SIQ_MATH_EXPR_FIRST = re.compile(
+    r"^\s*(?P<expr>[-+*/%()\d\s.]{3,80})\s*", re.U
+)
+_SIQ_MATH_EXPRESSION = re.compile(r"^(?P<expr>[-+*/%()\d\s.]{3,80})", re.U)
+_SIQ_ONLY_NUMBER_TAILS = (
+    # Restrict output to a single integer; do not bypass the model for
+    # explanation, translation, quoted expressions or multi-task requests.
+    re.compile(r"^return only the integer,? with no other text\.?$", re.I),
+    re.compile(r"^réponds uniquement par le nombre entier,? sans texte\.?$", re.I),
+    re.compile(r"^antworte nur mit der ganzen zahl,? ohne zusätzlichen text\.?$", re.I),
+    re.compile(r"^أجب بالعدد الصحيح فقط دون أي كلمات[.؟]?$"),
+    re.compile(r"^responde apenas com o número inteiro,? sem outras palavras\.?$", re.I),
+    re.compile(r"^responde únicamente con el número entero,? sin palabras\.?$", re.I),
+    re.compile(r"^odgovori samo cijelim brojem,? bez dodatnog teksta\.?$", re.I),
+    re.compile(r"^rispondi soltanto con il numero intero,? senza testo aggiuntivo\.?$", re.I),
+    re.compile(r"^只输出整数[。.]?$"),
+    re.compile(r"^を計算し、整数だけを答えてください[。.]?$"),
+    re.compile(r"^की गणना करें[।.]?\s*केवल पूर्णांक लिखें[।.]?$"),
+    re.compile(r"^işlemini hesaplayın\.?\s*yalnızca tam sayıyı yazın\.?$", re.I),
+    re.compile(r"^jibu kwa nambari kamili pekee\.?$", re.I),
+    re.compile(r"^выведи только целое число\.?$", re.I),
+)
+
+
+def strict_multilingual_arithmetic(prompt: str) -> DeterministicExpectation | None:
+    """Prove ONE arithmetic result after bounding instruction and output scope.
+
+    This is intentionally opt-in for explicit output-only arithmetic utterances.
+    A single model is never loaded; unknown/compound requests return None.
+    """
+    if len(prompt) > 480 or "\n" in prompt or '"' in prompt or "'" in prompt:
+        return None
+    m = _SIQ_MATH_PREFIX.match(prompt)
+    start = m.end() if m else 0
+    expression = _SIQ_MATH_EXPRESSION.match(prompt[start:])
+    if expression is None:
+        return None
+    raw = expression.group("expr").strip().rstrip(". ")
+    if len(re.findall(r"\d+", raw)) < 2 or not re.search(r"[+*/%\-]", raw):
+        return None
+    tail = prompt[start + expression.end():].strip()
+    # The command-first grammars use a clause separator; the expression-first
+    # grammars (JA/HI/TR) put the mathematical verb in the suffix.
+    if not m and not any(tail.startswith(marker) for marker in ("を計算", "की गणना", "işlemini ")):
+        return None
+    tail = tail.lstrip(".】【。। ").strip()
+    if not any(pattern.fullmatch(tail) for pattern in _SIQ_ONLY_NUMBER_TAILS):
+        return None
+    try:
+        result = _safe_number(ast.parse(raw, mode="eval"))
+        if isinstance(result, float) and not result.is_integer():
+            return None
+        return DeterministicExpectation("arithmetic", _format_number(result))
+    except (SyntaxError, ValueError, OverflowError, ZeroDivisionError, TypeError):
+        return None
+
+
+def _siq_safe_bare_literal(value: str) -> bool:
+    """Never turn bare lower-case inflected nouns into a proven echo value.
+
+    E.g. Croatian 'Odgovori samo slovom' (answer using a letter) is not
+    an instruction to print 'slovom'. Explicit uppercase codes remain legal.
+    """
+    # Restrict only ambiguous lowercase *Latin-script* unquoted words.
+    # Non-Latin scripts (e.g. Arabic affirmative نعم) retain prior behavior;
+    # explicit quoted/colon forms are governed separately.
+    return not (value.isalpha() and value.islower()
+                and all('LATIN' in unicodedata.name(c, '') for c in value))
+
+
 _SORT = re.compile(
     r"(?:sort|trie|trier|ordonne|ordena|sortiraj).{0,50}?(?P<nums>-?\d+(?:\s*[,;]\s*-?\d+){1,20})",
     re.I | re.S,
@@ -193,6 +276,23 @@ _EXACT_FR = re.compile(
     re.I | re.S,
 )
 
+# FIX7: natural single-token exact-output directives such as
+# ``Réponds uniquement OK.`` are locally provable too.  Keep this deliberately
+# narrow: exactly one non-whitespace token, anchored at the end, so requests
+# such as ``Réponds uniquement par le code`` are NOT mistaken for literal echo.
+_EXACT_BARE_TOKEN = re.compile(
+    r"(?:\b(?:reply|respond|answer|return)\s+(?:only|exactly)|"
+    r"\b(?:r[eé]ponds?|r[eé]pondez|retourne|retournez|donne|donnez)\s+(?:uniquement|seulement|exactement)|"
+    r"\b(?:antworte|gib)\s+(?:nur|genau)|"
+    r"\b(?:odgovori|vrati)\s+(?:samo|to[cč]no)|"
+    r"\b(?:rispondi|restituisci)\s+(?:solo|esattamente)|"
+    r"\b(?:responde|devuelve)\s+(?:solo|exactamente)|"
+    r"\b(?:responde|responda|devolve|devolva)\s+(?:apenas|exatamente)|"
+    r"(?:أجب|اجب|اكتب)\s+(?:فقط|حصراً|حصرا))"
+    r"\s+(?P<value>[^\s.!?。！？،]{1,96})[.!?。！？،]?\s*$",
+    re.I,
+)
+
 _ALLOWED_BINOPS: dict[type[ast.operator], Any] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -277,6 +377,14 @@ def deterministic_expectation(prompt: str) -> DeterministicExpectation | None:
             except (ValueError, OverflowError):
                 return None
 
+    symbolic = prove_symbolic_task(value)
+    if symbolic is not None:
+        return DeterministicExpectation(symbolic.subtask, symbolic.result)
+
+    siq_math = strict_multilingual_arithmetic(value)
+    if siq_math is not None:
+        return siq_math
+
     m = _ARITH.search(value)
     if m:
         expr = m.group("expr").strip().rstrip(". ,;")
@@ -298,11 +406,12 @@ def deterministic_expectation(prompt: str) -> DeterministicExpectation | None:
     if extraction is not None:
         return extraction
 
-    for pattern in (_EXACT_EN, _EXACT_FR):
+    for pattern in (_EXACT_EN, _EXACT_FR, _EXACT_BARE_TOKEN):
         m = pattern.search(value)
         if m:
             expected = m.group("value").strip().strip('"\'` ')
-            if expected and len(expected) <= 96 and "\n" not in expected:
+            if (expected and len(expected) <= 96 and "\n" not in expected
+                    and (pattern is not _EXACT_BARE_TOKEN or _siq_safe_bare_literal(expected))):
                 return DeterministicExpectation("exact_echo", expected.rstrip(". "))
     return None
 

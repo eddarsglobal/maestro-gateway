@@ -8,7 +8,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import unicodedata
 from typing import Literal
+
+from .multilingual_mission_contract import parse_mission_contract
 
 Status = Literal['PASS_SHAPE', 'FAIL_SHAPE', 'ABSTAIN']
 
@@ -20,25 +23,29 @@ class ShapeCheck:
     factual_truth_verified: bool = False
 
 
-# Only an explicit instruction triggers a shape contract.  The supported
-# fragments are intentionally limited; other UI languages safely abstain.
-_TWO_SENTENCES = re.compile(
-    r"(?:\b(?:en\s+)?(?:exactement\s+)?(?:deux|2)\s+(?:courtes?\s+)?phrases?\b|"
-    r"\b(?:in\s+)?(?:exactly\s+)?(?:two|2)\s+(?:short\s+)?sentences?\b|"
-    r"\b(?:in\s+)?(?:genau\s+)?(?:zwei|2)\s+(?:kurzen?\s+)?s[aä]tzen?\b|"
-    r"\b(?:u\s+)?(?:to[cč]no\s+)?(?:dvije|dve|2)\s+re[cč]enice\b|"
-    r"\b(?:in\s+)?(?:esattamente\s+)?(?:due|2)\s+frasi\b|"
-    r"\b(?:en\s+)?(?:exactamente\s+)?(?:dos|2)\s+frases\b|"
-    r"\b(?:em\s+)?(?:exatamente\s+)?(?:duas|2)\s+frases\b|"
-    r"(?:في\s+)?جملتين\s*(?:فقط)?\b)", re.I,
+# Only an explicit instruction triggers a shape contract.  Each supported
+# language has a narrow intent + count/noun pair.  Adjectives may appear between
+# the number and the sentence noun (for example German "zwei natürliche ...
+# Sätze").  This validates count/shape only; it never certifies grammar.
+_TWO_SENTENCE_PATTERNS: tuple[tuple[re.Pattern[str], re.Pattern[str]], ...] = (
+    (re.compile(r"\b(?:r[eé]ponds?|r[eé]pondez|[eé]cris|[eé]crivez|explique|d[eé]cris)\b", re.I),
+     re.compile(r"\b(?:deux|2)\b.{0,100}\bphrases?\b", re.I | re.S)),
+    (re.compile(r"\b(?:reply|respond|write|explain|describe|give)\b", re.I),
+     re.compile(r"\b(?:two|2)\b.{0,100}\bsentences?\b", re.I | re.S)),
+    (re.compile(r"\b(?:antworte|ntworte|schreibe|erkl[aä]re|beschreibe|gib)\b", re.I),
+     re.compile(r"\b(?:zwei|2)\b.{0,120}\bs[aä]tze(?:n)?\b", re.I | re.S)),
+    (re.compile(r"\b(?:odgovori|pi[šs]i|napi[šs]i|objasni|opi[šs]i|navedi)\b", re.I),
+     re.compile(r"\b(?:dvije|dve|2)\b.{0,100}\bre[cč]enice\b", re.I | re.S)),
+    (re.compile(r"\b(?:rispondi|scrivi|spiega|descrivi)\b", re.I),
+     re.compile(r"\b(?:due|2)\b.{0,100}\bfrasi\b", re.I | re.S)),
+    (re.compile(r"\b(?:responde|escribe|explica|describe)\b", re.I),
+     re.compile(r"\b(?:dos|2)\b.{0,100}\bfrases\b", re.I | re.S)),
+    (re.compile(r"\b(?:responde|escreve|explica|descreve)\b", re.I),
+     re.compile(r"\b(?:duas|2)\b.{0,100}\bfrases\b", re.I | re.S)),
+    (re.compile(r"(?:أجب|اجب|اكتب|اشرح|وضّح|وضح|صِف|صف)"),
+     re.compile(r"(?:جملتين|جملتان|جملتين\s+فقط)")),
 )
-_TWO_INTENT = re.compile(
-    r"\b(?:explique(?:[- ]?moi)?|expliquer|r[eé]ponds?|r[eé]pondez|"
-    r"d[eé]cris|r[eé]sume|donne(?:[- ]?moi)?|antworte|erkl[aä]re|"
-    r"beschreibe|schreibe|fasse|reply|respond|explain|summarize|"
-    r"describe|write|give|objasni|navedi|spiega|spiegami|"
-    r"explica|explique|descreve|escreve)\b|اشرح|وضّح", re.I,
-)
+
 _THREE_STEPS = re.compile(
     r"(?:\b(?:trois|three|drei|tri|tre|tres|tr[eê]s|3)\b.{0,56}?"
     r"\b(?:[eé]tapes?|steps?|schritte|korak\w*|passaggi|passi|pasos?|passos?)\b|"
@@ -80,10 +87,99 @@ _AMBIGUOUS_SENTENCES = re.compile(
 )
 
 
+
+_EXACT_LITERAL_PATTERNS = (
+    re.compile(r"(?:respond|reply|return|answer)\s+(?:only\s+with|exactly)\s*[:：]?\s*([^\n]+?)(?:\s+and\s+nothing\s+else)?$", re.I),
+    re.compile(r"(?:r[eé]ponds?|r[eé]pondez|retourne|retournez)\s+(?:uniquement\s+avec|exactement|uniquement)\s*[:：]\s*([^\n]+)$", re.I),
+    re.compile(r"(?:antworte|gib)\s+(?:ausschlie[ßs]lich|nur)\s+mit\s*[:：]\s*([^\n]+)$", re.I),
+    re.compile(r"(?:odgovori|vrati)\s+(?:isklju[cč]ivo|samo)\s+(?:sa|s)\s*[:：]\s*([^\n]+)$", re.I),
+    re.compile(r"(?:rispondi|restituisci)\s+(?:esclusivamente|solo)\s+con\s*[:：]\s*([^\n]+)$", re.I),
+    re.compile(r"(?:responde|devuelve)\s+(?:exclusivamente|[uú]nicamente|solo)\s+con\s*[:：]\s*([^\n]+)$", re.I),
+    re.compile(r"(?:responde|devolve)\s+(?:exclusivamente|apenas)\s+com\s*[:：]\s*([^\n]+)$", re.I),
+    re.compile(r"(?:أجب|اجب)\s+(?:فقط|حصراً|حصرا)\s+(?:بـ?|ب)\s*[:：]?\s*([^\n]+)$"),
+)
+
+# FIX7: one-token literal syntax without a colon, e.g. ``Réponds uniquement OK.``.
+# Anchoring + a single token prevents ``Réponds uniquement par le code`` from
+# becoming a bogus literal contract.
+_EXACT_BARE_TOKEN = re.compile(
+    r"(?:\b(?:reply|respond|answer|return)\s+(?:only|exactly)|"
+    r"\b(?:r[eé]ponds?|r[eé]pondez|retourne|retournez|donne|donnez)\s+(?:uniquement|seulement|exactement)|"
+    r"\b(?:antworte|gib)\s+(?:nur|genau)|"
+    r"\b(?:odgovori|vrati)\s+(?:samo|to[cč]no)|"
+    r"\b(?:rispondi|restituisci)\s+(?:solo|esattamente)|"
+    r"\b(?:responde|devuelve)\s+(?:solo|exactamente)|"
+    r"\b(?:responde|responda|devolve|devolva)\s+(?:apenas|exatamente)|"
+    r"(?:أجب|اجب|اكتب)\s+(?:فقط|حصراً|حصرا))"
+    r"\s+([^\s.!?。！？،]{1,96})[.!?。！？،]?\s*$",
+    re.I,
+)
+
+
+_CONDITIONAL_EXACT_TAIL = re.compile(
+    r"(?:\s|[,;،]\s*)(?:if|otherwise|else|si|sinon|wenn|sonst|"
+    r"ako|ina[cč]e|se|altrimenti|de\s+lo\s+contrario|si\s+no|"
+    r"sen[aã]o|caso\s+contr[aá]rio|إذا|إن|وإلا|وإلّا)\b",
+    re.I,
+)
+_NESTED_EXACT_DIRECTIVE = re.compile(
+    r"\b(?:respond|reply|return|answer)\s+(?:only\s+with|exactly)\b|"
+    r"\b(?:antworte|gib)\s+(?:ausschlie[ßs]lich|nur)\s+mit\b|"
+    r"\b(?:r[eé]ponds?|r[eé]pondez|retourne|retournez)\s+"
+    r"(?:uniquement|exactement)\b",
+    re.I,
+)
+
+
+def explicit_exact_literal(prompt: str) -> str | None:
+    value = str(prompt or "").strip()
+    for pattern in (*_EXACT_LITERAL_PATTERNS, _EXACT_BARE_TOKEN):
+        match = pattern.search(value)
+        if match:
+            literal = match.group(1).strip().strip('"“”')
+            # SIQ-P0.2: bare lower-case nouns indicate an output *format*, not
+            # provable literal content (Croatian kodom/slovom/riječju).
+            # Explicit colon/quoted token contracts remain under older rules.
+            if (pattern is _EXACT_BARE_TOKEN and literal.isalpha()
+                    and literal.islower()
+                    and all('LATIN' in unicodedata.name(ch, '') for ch in literal)):
+                continue
+            # A conditional classifier such as
+            # ``Return exactly OUI if ..., otherwise return exactly NON``
+            # is not a literal-output contract.  Its answer is decided by the
+            # deterministic semantic verifier.  Treating the whole tail as an
+            # exact literal would reject the *correct* zero-model Core answer.
+            # Fail closed by abstaining from this narrow shape check whenever
+            # branching language or another exact directive appears inside the
+            # captured tail.
+            if (_CONDITIONAL_EXACT_TAIL.search(literal)
+                    or _NESTED_EXACT_DIRECTIVE.search(literal)):
+                return None
+            return literal or None
+    return None
+
+
+def _exact_literal_shape(request: str, answer: str) -> ShapeCheck | None:
+    literal = explicit_exact_literal(request)
+    if literal is None:
+        return None
+    actual = str(answer or "").strip()
+    if actual == literal:
+        return ShapeCheck('PASS_SHAPE', 'exact_literal_case_sensitive_match')
+    return ShapeCheck('FAIL_SHAPE', 'exact_literal_case_sensitive_mismatch')
+
 def explicit_two_sentences(prompt: str) -> bool:
-    """Detect only narrow, explicit two-sentence instructions."""
-    return bool(isinstance(prompt, str) and _TWO_SENTENCES.search(prompt)
-                and _TWO_INTENT.search(prompt))
+    """Detect explicit two-sentence requests across the eight UI languages.
+
+    Detection is intentionally about the *count contract* only.  Passing this
+    function never means the generated prose is grammatical or semantically
+    correct; it merely enables an objective two-sentence delivery gate.
+    """
+    if not isinstance(prompt, str) or not prompt.strip():
+        return False
+    return (parse_mission_contract(prompt).sentence_count == 2 or
+            any(intent.search(prompt) and count.search(prompt)
+                for intent, count in _TWO_SENTENCE_PATTERNS))
 
 
 def _sentence_shape(answer: str) -> ShapeCheck:
@@ -114,11 +210,11 @@ def _sentence_shape(answer: str) -> ShapeCheck:
     if _AMBIGUOUS_SENTENCES.search(answer):
         return ShapeCheck('ABSTAIN', 'ambiguous_sentence_boundaries')
     text = ' '.join(answer.strip().split())
-    sentences = [part.strip() for part in re.split(r'(?<=[.!?。！？])\s+', text)
+    sentences = [part.strip() for part in re.split(r'(?<=[.!?؟。！？])\s*', text)
                  if part.strip()]
     if len(sentences) != 2:
         return ShapeCheck('FAIL_SHAPE', f'expected_two_sentences_got_{len(sentences)}')
-    if any(not re.search(r'[.!?。！？]$', part) for part in sentences):
+    if any(not re.search(r'[.!?؟。！？]$', part) for part in sentences):
         return ShapeCheck('ABSTAIN', 'ambiguous_terminal_punctuation')
     return ShapeCheck('PASS_SHAPE', 'two_sentences_only_not_factual_proof')
 
@@ -193,13 +289,76 @@ def _step_shape(answer: str) -> ShapeCheck:
     return ShapeCheck('PASS_SHAPE', 'three_steps_and_limit_shape_only')
 
 
+
+
+_ARABIC_ONLY_REQUEST = re.compile(
+    r"(?:أجب|اجب|اكتب|تحدث).{0,120}(?:العربية|بالعربية)|"
+    r"(?:لا|دون|بدون).{0,60}(?:كلمات?\s+إنجليزية|الإنجليزية|أحرف?\s+لاتينية)",
+    re.S,
+)
+_GERMAN_ONLY_REQUEST = re.compile(
+    r"\b(?:antworte|ntworte|schreibe|sprich)\b.{0,100}\b(?:nur\s+auf\s+deutsch|auf\s+deutsch|deutsch)\b",
+    re.I | re.S,
+)
+
+def _explicit_language_script_shape(request: str, answer: str) -> ShapeCheck | None:
+    """Reject only obvious script violations of an explicit language-only request.
+
+    This is not a fluency detector.  It catches mechanically provable violations
+    such as English/Latin words in an Arabic-only response (while allowing the
+    product name MAESTRO) or Arabic/CJK text in a German-only response.
+    """
+    req = str(request or "")
+    out = str(answer or "")
+    if _ARABIC_ONLY_REQUEST.search(req):
+        cleaned = re.sub(r"MAESTRO", "", out, flags=re.I)
+        # FIX8: do not maintain an incomplete blacklist of Latin/CJK/Cyrillic.
+        # For an explicit Arabic-only contract, every remaining alphabetic
+        # character must belong to an Arabic Unicode repertoire.  Digits,
+        # punctuation and whitespace remain allowed; MAESTRO is the sole
+        # product-name exception removed above.
+        foreign_letters = [
+            ch for ch in cleaned
+            if ch.isalpha() and "ARABIC" not in unicodedata.name(ch, "")
+        ]
+        if foreign_letters:
+            return ShapeCheck('FAIL_SHAPE', 'arabic_only_foreign_script')
+    if _GERMAN_ONLY_REQUEST.search(req):
+        from .native_linguistic_revision import _english_fallback
+        if _english_fallback(out):
+            return ShapeCheck('FAIL_SHAPE', 'german_only_english_fallback')
+        cleaned = re.sub(r"MAESTRO", "", out, flags=re.I)
+        if re.search(r"[\u0600-\u06ff\u3400-\u9fff\u3040-\u30ff\u0400-\u04ff]", cleaned):
+            return ShapeCheck('FAIL_SHAPE', 'german_only_foreign_script')
+    return None
+
+def _one_sentence_shape(answer: str) -> ShapeCheck:
+    if '```' in answer or _AMBIGUOUS_SENTENCES.search(answer):
+        return ShapeCheck('ABSTAIN', 'ambiguous_sentence_boundaries')
+    text = ' '.join(answer.strip().split())
+    parts = [p.strip() for p in re.split(r'(?<=[.!?؟。！？])\s*', text) if p.strip()]
+    if len(parts) != 1:
+        return ShapeCheck('FAIL_SHAPE', f'expected_one_sentence_got_{len(parts)}')
+    if not re.search(r'[.!?؟。！？]$', parts[0]):
+        return ShapeCheck('ABSTAIN', 'ambiguous_terminal_punctuation')
+    return ShapeCheck('PASS_SHAPE', 'one_sentence_only_not_factual_proof')
+
+
 def evaluate_shape(request: str, answer: str) -> ShapeCheck:
     if not isinstance(request, str) or not isinstance(answer, str) or not answer.strip():
         return ShapeCheck('FAIL_SHAPE', 'empty_or_invalid_text')
     if '```' in request:
         return ShapeCheck('ABSTAIN', 'quoted_code_or_instruction_ambiguous')
+    exact = _exact_literal_shape(request, answer)
+    if exact is not None:
+        return exact
+    script = _explicit_language_script_shape(request, answer)
+    if script is not None:
+        return script
     if explicit_two_sentences(request):
         return _sentence_shape(answer)
+    if parse_mission_contract(request).sentence_count == 1:
+        return _one_sentence_shape(answer)
     if _THREE_STEPS.search(request) and _LIMIT_REQUEST.search(request):
         return _step_shape(answer)
     return ShapeCheck('ABSTAIN', 'no_supported_explicit_shape_contract')

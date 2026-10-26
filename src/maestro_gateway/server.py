@@ -50,6 +50,9 @@ from .git_staging import (
 from .mission import GovernedDirectMissionRunner
 from .request_journal import RequestReplayBlocked
 from .mission_control import MissionControl, MissionConflictError, MissionCancelledError
+from .native_admission import NativeAdmissionBarrier, ForegroundAdmissionBusy
+from .cross_process_foreground import CrossProcessForegroundAdmission
+from .gateway_owner_lease import GatewayOwnerLease, OwnerBlocked
 from .software_artifact_verifier import (
     VerifiedSoftwareArtifacts, ArtifactVerificationError,
 )
@@ -142,7 +145,11 @@ def choose_native_path(kind: str) -> str | None:
 
 
 class GatewayHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
+    # Ownership must outlive every request thread that can publish durable state.
+    # A daemon thread could outlive server_close() and write AFTER the owner
+    # lease is released. Never claim safety if an active request has not exited.
+    daemon_threads = False
+    block_on_close = True
     allow_reuse_address = True
 
     def __init__(
@@ -152,7 +159,12 @@ class GatewayHTTPServer(ThreadingHTTPServer):
         *,
         config: GatewayConfig,
         core: MaestroCoreBridge,
+        owner_lease: GatewayOwnerLease,
     ):
+        # An unowned server must never initialize any durable user journal.
+        if not isinstance(owner_lease, GatewayOwnerLease) or owner_lease.fd is None:
+            raise OwnerBlocked("Gateway server requires a held process owner lease")
+        self._owner_lease = owner_lease
         super().__init__(
             server_address,
             handler_class,
@@ -174,6 +186,14 @@ class GatewayHTTPServer(ThreadingHTTPServer):
             ConversationStore(
                 user_root / "conversations"
             )
+        )
+
+        # Read language benchmark evidence synchronously before accepting a
+        # first mission. It is local, digest-bound metadata only: no model is
+        # started, selected, downloaded, or contacted by this read.
+        from .language_benchmark_evidence import load_language_benchmark_evidence
+        load_language_benchmark_evidence(
+            Path.home() / ".maestro" / "runtime" / "language_benchmark_evidence.json"
         )
 
         # Read metrics before prompts; routing hot path uses only cached evidence.
@@ -212,6 +232,12 @@ class GatewayHTTPServer(ThreadingHTTPServer):
         )
 
         self.mission_control = MissionControl(user_root / "mission-controls")
+        # P0.4.3b2c: native admission is atomic within this Gateway process.
+        # No provider-quiescence proof exists; autonomous inference remains BLOCKED.
+        self.model_admission = CrossProcessForegroundAdmission(
+            lock_root=Path.home() / ".maestro" / "runtime" / "admission-p043b2g",
+            adapter_cancellation_verified=False,
+        )
         # V8: automatic, idle-only and local-only qualification. An idle worker
         # never boots Core, installs a model, or bypasses the authorized registry.
         def approved_candidates():
@@ -241,7 +267,8 @@ class GatewayHTTPServer(ThreadingHTTPServer):
             state_path=user_root / 'model-qualifications' / 'v8.json',
             idle_seconds=float(os.getenv('MAESTRO_PROBE_IDLE_SECONDS', '90')),
             probe_timeout=float(os.getenv('MAESTRO_PROBE_TIMEOUT_SECONDS', '25')),
-            enabled=os.getenv('MAESTRO_AUTO_QUALIFICATION', '1') != '0')
+            enabled=os.getenv('MAESTRO_AUTO_QUALIFICATION', '1') != '0',
+            admission=self.model_admission)
         self.autonomous_qualification.start()
         self.capabilities = CapabilityRegistry()
 
@@ -259,9 +286,15 @@ class GatewayHTTPServer(ThreadingHTTPServer):
         )
 
     def server_close(self) -> None:
-        # Stop background probes when Gateway exits; never leave them running.
+        # Refuse to relinquish ownership unless all services and request threads
+        # have stopped cleanly. On failure, the lock stays held until process exit.
+        self.model_admission.shutdown()
         self.autonomous_qualification.shutdown()
         super().server_close()
+        owned = getattr(self, "_owner_lease", None)
+        if owned is not None:
+            self._owner_lease = None
+            owned.__exit__(None, None, None)
 
 
 
@@ -1077,6 +1110,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "sources": len([row for row in inventory if row.get("selection_enabled")]),
                 "primary": self.server.core.primary_intelligence.snapshot(),
                 "autonomous_qualification": self.server.autonomous_qualification.status(),
+                "native_model_admission": self.server.model_admission.status(),
                 "operational_qualification_evidence": inspect_operational_evidence(
                     self.server.core.system.sovereign_intelligence.registry.all()),
                 "qualification_evidence": [
@@ -2279,6 +2313,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if path == "/mission":
             if not self._require_session():
                 return
+            # Fail closed before request registration if a server was assembled
+            # without the native admission barrier. In particular, do NOT
+            # silently run Core when an adapter or legacy HTTP fixture omitted it.
+            if not isinstance(getattr(self.server, "model_admission", None), NativeAdmissionBarrier):
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                    "error": "native_model_admission_unavailable",
+                    "message": "Native mission admission was not initialized",
+                })
+                return
 
             try:
                 payload = self._read_json()
@@ -2286,92 +2329,105 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 request_id = payload.get("request_id")
                 result = None
                 cancellation = None
-                if request_id is not None:
-                    # Stable HTTP identity must reach the durable DIRECT lease.
-                    # MissionControl records the cancellation lifecycle separately.
-                    try:
-                        cancellation = self.server.mission_control.register(request_id)
-                    except MissionConflictError:
-                        # A completed request may be returned only after read-only
-                        # verification of the durable request *and* conversation
-                        # receipts. Never call the ordinary run() path here: if
-                        # the request receipt is missing it could execute Core.
-                        record = self.server.mission_control.status(request_id)
-                        if (record["state"] == "completed"
-                                and payload.get("mode", "M0_DIRECT") == "M0_DIRECT"):
-                            replayed = self.server.mission_runner.replay_completed_only(
-                                request_id=request_id,
-                                prompt=payload.get("prompt"),
-                                model=payload.get("model"),
-                                max_tokens=payload.get("max_tokens", 512),
-                                conversation_id=payload.get("conversation_id"),
-                                workspace_id=payload.get("workspace_id"),
-                                ui_language=payload.get("ui_language"),
-                            )
-                            self._send_json(
-                                HTTPStatus.OK if replayed.get("ok") else HTTPStatus.UNPROCESSABLE_ENTITY,
-                                replayed,
-                            )
-                            return
-                        raise
-                foreground_engaged = False
+                # Claim the bounded foreground lease FIRST, before any durable
+                # MissionControl request ID registration. A rejected admission
+                # must leave no queued/ghost receipt and must execute no Core.
+                foreground_token = self.server.model_admission.begin_foreground(wait_seconds=2.0)
                 try:
                     if request_id is not None:
-                        self.server.mission_control.start(request_id)
-                    self.server.autonomous_qualification.user_activity(True)
-                    foreground_engaged = True
-                    result = (
-                        self.server
-                        .mission_runner
-                        .run(
-                        prompt=payload.get(
-                            "prompt"
-                        ),
-                        model=payload.get(
-                            "model"
-                        ),
-                        max_tokens=payload.get(
-                            "max_tokens",
-                            512,
-                        ),
-                        conversation_id=(
-                            payload.get(
-                                "conversation_id"
-                            )
-                        ),
-                        workspace_id=(
-                            payload.get(
-                                "workspace_id"
-                            )
-                        ),
-                        mode=payload.get(
-                            "mode",
-                            "M0_DIRECT",
-                        ),
-                        research_url=(
-                            payload.get(
-                                "research_url"
-                            )
-                        ),
-                        ui_language=payload.get("ui_language"),
-                        cancellation=cancellation,
-                        request_id=(request_id if payload.get("mode", "M0_DIRECT") == "M0_DIRECT"
-                                    else None),
-                    )
-                    )
-                finally:
-                    if foreground_engaged:
-                        self.server.autonomous_qualification.user_activity(False)
-                    if request_id is not None and cancellation is not None:
-                        self.server.mission_control.finish(
-                            request_id, success=bool(result and result.get("ok")),
-                            cancelled=cancellation.is_set(),
-                            durable_committed=bool(result and result.get("tx_committed")),
+                        # Stable HTTP identity must reach the durable DIRECT lease.
+                        # MissionControl records the cancellation lifecycle separately.
+                        try:
+                            cancellation = self.server.mission_control.register(request_id)
+                        except MissionConflictError:
+                            # A completed request may be returned only after read-only
+                            # verification of the durable request *and* conversation
+                            # receipts. Never call the ordinary run() path here: if
+                            # the request receipt is missing it could execute Core.
+                            record = self.server.mission_control.status(request_id)
+                            if (record["state"] == "completed"
+                                    and payload.get("mode", "M0_DIRECT") == "M0_DIRECT"):
+                                replayed = self.server.mission_runner.replay_completed_only(
+                                    request_id=request_id,
+                                    prompt=payload.get("prompt"),
+                                    model=payload.get("model"),
+                                    max_tokens=payload.get("max_tokens", 512),
+                                    conversation_id=payload.get("conversation_id"),
+                                    workspace_id=payload.get("workspace_id"),
+                                    ui_language=payload.get("ui_language"),
+                                )
+                                self._send_json(
+                                    HTTPStatus.OK if replayed.get("ok") else HTTPStatus.UNPROCESSABLE_ENTITY,
+                                    replayed,
+                                )
+                                return
+                            raise
+                    foreground_engaged = False
+                    try:
+                        if request_id is not None:
+                            self.server.mission_control.start(request_id)
+                        self.server.autonomous_qualification.user_activity(True)
+                        foreground_engaged = True
+                        result = (
+                            self.server
+                            .mission_runner
+                            .run(
+                            prompt=payload.get(
+                                "prompt"
+                            ),
+                            model=payload.get(
+                                "model"
+                            ),
+                            max_tokens=payload.get(
+                                "max_tokens",
+                                512,
+                            ),
+                            conversation_id=(
+                                payload.get(
+                                    "conversation_id"
+                                )
+                            ),
+                            workspace_id=(
+                                payload.get(
+                                    "workspace_id"
+                                )
+                            ),
+                            mode=payload.get(
+                                "mode",
+                                "M0_DIRECT",
+                            ),
+                            research_url=(
+                                payload.get(
+                                    "research_url"
+                                )
+                            ),
+                            ui_language=payload.get("ui_language"),
+                            cancellation=cancellation,
+                            request_id=(request_id if payload.get("mode", "M0_DIRECT") == "M0_DIRECT"
+                                        else None),
                         )
+                        )
+                    finally:
+                        if foreground_engaged:
+                            self.server.autonomous_qualification.user_activity(False)
+                        if request_id is not None and cancellation is not None:
+                            self.server.mission_control.finish(
+                                request_id, success=bool(result and result.get("ok")),
+                                cancelled=cancellation.is_set(),
+                                durable_committed=bool(result and result.get("tx_committed")),
+                            )
+                finally:
+                    # Includes duplicate completed replay, validation errors,
+                    # cancellation, Core failure, and durable finish failures.
+                    self.server.model_admission.end_foreground(foreground_token)
             except RequestReplayBlocked as exc:
                 # A conflict is not proof of a failed or rolled-back Core TX.
                 self._send_json(HTTPStatus.CONFLICT,
                                 {"error": "mission_reconciliation_required", "message": str(exc)})
+                return
+            except ForegroundAdmissionBusy as exc:
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                    "error": "native_model_admission_busy", "message": str(exc)})
                 return
             except MissionConflictError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error":"duplicate_mission_request", "message":str(exc)})
@@ -2639,19 +2695,24 @@ def build_server(
         config
         or GatewayConfig.from_env()
     )
-    core = MaestroCoreBridge(
-        config.runtime_dir
-    )
-
-    return GatewayHTTPServer(
-        (
-            config.host,
-            config.port,
-        ),
-        GatewayHandler,
-        config=config,
-        core=core,
-    )
+    # The same local identity is used for all ports and all Gateway processes
+    # sharing ~/.maestro/user/mission-controls. This path is NOT env-tunable.
+    # A future authenticated installer must provision this directory (0700).
+    # Until then failure to find an owner-only path deliberately blocks boot.
+    owner_root = Path.home() / ".maestro" / "runtime" / "gateway-owner-p043b2j"
+    owner_lease = GatewayOwnerLease(owner_root)
+    owner_lease.__enter__()
+    try:
+        # Acquire journal ownership BEFORE any Core or journal construction,
+        # socket bind, background worker, or route-history initialization.
+        core = MaestroCoreBridge(config.runtime_dir)
+        return GatewayHTTPServer(
+            (config.host, config.port), GatewayHandler,
+            config=config, core=core, owner_lease=owner_lease,
+        )
+    except BaseException:
+        owner_lease.__exit__(None, None, None)
+        raise
 
 
 def main() -> int:

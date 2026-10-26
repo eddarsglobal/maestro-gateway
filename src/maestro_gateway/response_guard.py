@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from .response_constraints import evaluate_shape
+from .response_constraints import evaluate_shape, explicit_two_sentences
+from .multilingual_mission_contract import obvious_contract_failure
+from .delivery_contracts import observed_regression_failure
 
 
 # An imperative request to reproduce text is different from a frustrated
@@ -50,7 +52,8 @@ _LANGUAGE_QUESTION = re.compile(
     r"(?:\b(?:na\s+kojem(?:\s+si\s+mi)?(?:\s+to)?\s+jeziku|"
     r"koj[ie]\s+(?:je\s+to\s+)?jezik|kojim\s+jezikom|"
     r"which\s+language|what\s+language|quelle\s+langue|"
-    r"welche\s+sprache)\b)",
+    r"welche\s+sprache|quale\s+lingua|qué\s+idioma|que\s+idioma)\b|"
+    r"ما\s+اللغة|اللغة\s+التي\s+طلبت)",
     re.IGNORECASE,
 )
 _CROATIAN_MALFORMED = re.compile(r"\b(?:ašu|jaš|moždaj)\b", re.I)
@@ -67,9 +70,18 @@ _CROATIAN_OUTPUT = re.compile(
     r"nerazumljiv\w*|pogrešn\w*)\b", re.I,
 )
 _LANGUAGE_NAMES = re.compile(
-    r"\b(?:hrvatsk\w*|croatian|bosansk\w*|serbian|srpsk\w*|"
-    r"englesk\w*|english|francusk\w*|french|njemačk\w*|german|"
-    r"nerazumljiv\w*|neprepoznatljiv\w*)\b", re.I,
+    r"(?:\b(?:hrvatsk\w*|croatian|bosansk\w*|serbian|srpsk\w*|"
+    r"englesk\w*|english|englisch|inglese|inglés|ingles|inglês|"
+    r"francusk\w*|french|französisch|francese|francés|frances|francês|"
+    r"njemačk\w*|german|deutsch|tedesco|alemán|aleman|alemão|"
+    r"arabic|arabisch|arapsk\w*|arabo|árabe|arabe|"
+    r"portuguese|portugiesisch|portoghese|português|portugues|"
+    r"spanish|spanisch|spagnolo|español|espanol|"
+    r"italian|italienisch|italiano|croato|kroatisch|"
+    r"nerazumljiv\w*|neprepoznatljiv\w*)\b|"
+    r"(?:الإنجليزية|الانجليزية|الفرنسية|الألمانية|الالمانية|العربية|"
+    r"البرتغالية|الإسبانية|الاسبانية|الكرواتية|الإيطالية|الايطالية))",
+    re.I,
 )
 _LANGUAGE_ERROR_ACK = re.compile(
     r"\b(?:pogrešn\w*|neispravn\w*|nerazumljiv\w*|"
@@ -124,6 +136,100 @@ def asks_for_software_project(prompt: str) -> bool:
     return bool(_SOFTWARE_SUBJECT.search(value) and _SOFTWARE_ACTION.search(value))
 
 _WORD = re.compile(r"\w+", re.UNICODE)
+
+
+# FIX7: a user-facing answer must not turn a language/format instruction into
+# answer content.  This is a narrow lexical leak detector, not a fluency test.
+# It only compares imperative lines from the CURRENT prompt with the output.
+_META_DIRECTIVE_LINE = re.compile(
+    r"^\s*(?:reply|respond|answer|write|return|"
+    r"r[eé]ponds?|r[eé]pondez|[eé]cris|[eé]crivez|utilise|utilisez|"
+    r"antworte|schreibe|verwende|"
+    r"odgovori|odgovaraj|napi[šs]i|pi[šs]i|"
+    r"rispondi|scrivi|usa|"
+    r"responde|escribe|utiliza|"
+    r"responde|escreve|usa|"
+    r"أجب|اجب|اكتب|استخدم|لا\s+تستخدم)\b",
+    re.I,
+)
+
+# FIX12: a direct bounded answer must not begin with an answer-about-the-answer
+# preamble or restate the user's question as answer content. These are delivery
+# contract checks only; they never certify grammar or factual truth.
+_ARABIC_META_ANSWER_PREAMBLE = re.compile(
+    r"^\s*(?:الجواب|الإجابة|الاجابة)(?:\s+(?:على|عن))?(?:\s+السؤال)?\s*(?:هو|هي)?\s*[:：-]?",
+    re.I,
+)
+
+
+def _question_restatement(prompt: str, output: str) -> bool:
+    if not explicit_two_sentences(prompt):
+        return False
+    requested = []
+    for line in str(prompt or '').splitlines():
+        line = line.strip()
+        if len(line) < 6 or not line.endswith(('?', '؟')):
+            continue
+        norm = _normalize(line)
+        if len(norm.split()) >= 2:
+            requested.append(norm)
+    if not requested:
+        return False
+    # FIX13-FIXED1: small local models may restate the question and begin
+    # answering on the same physical line. Match only at the beginning of the
+    # answer or one of its lines so topical mentions later remain allowed.
+    output_norm = _normalize(str(output or '').strip())
+    for question in requested:
+        if output_norm == question or output_norm.startswith(question + " "):
+            return True
+    for line in str(output or '').splitlines():
+        norm = _normalize(line.strip())
+        for question in requested:
+            if norm == question or norm.startswith(question + " "):
+                return True
+    return False
+
+
+def _direct_answer_meta_preamble(prompt: str, output: str) -> bool:
+    if not explicit_two_sentences(prompt):
+        return False
+    return bool(_ARABIC_META_ANSWER_PREAMBLE.search(str(output or '')))
+
+
+def _meta_instruction_echo(prompt: str, output: str) -> bool:
+    if explicit_repeat_request(prompt):
+        return False
+    out = _normalize(output)
+    if not out:
+        return False
+    out_words = out.split()
+    for line in str(prompt or '').splitlines():
+        if not _META_DIRECTIVE_LINE.search(line):
+            continue
+        norm = _normalize(line)
+        directive_words = norm.split()
+        # Require meaningful content; tiny directives such as "Answer." are
+        # too ambiguous for a fail-closed lexical rejection.
+        if len(norm) < 12 or len(directive_words) < 3:
+            continue
+        if norm in out:
+            return True
+        # FIX11: small local models often paraphrase the instruction as a
+        # preamble instead of copying it byte-for-byte. Compare only the
+        # beginning of the answer with the directive so ordinary topical word
+        # overlap later in a response cannot trigger this guard. This is still
+        # a narrow delivery check, not a fluency or semantic-truth test.
+        prefix_len = min(len(out_words), len(directive_words) + 2)
+        prefix_words = out_words[:prefix_len]
+        if len(prefix_words) >= 3:
+            prefix = " ".join(prefix_words)
+            directive_set = set(directive_words)
+            coverage = (len(directive_set.intersection(prefix_words))
+                        / max(1, len(directive_set)))
+            similarity = SequenceMatcher(None, norm, prefix).ratio()
+            if coverage >= 0.72 and similarity >= 0.78:
+                return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +313,48 @@ _GIT_PROPOSAL = re.compile(
     r"not\s+execute|non\s+ex[eé]cut[eé])\b", re.I)
 
 
+# G1-LIVE-004: narrow historical permissions-claim backstop for Croatian.
+# Only rejects a positive claim that local files can be read/searched WITHOUT
+# an authorized workspace, when the LIVE capability registry requires one.
+# This is not a permission engine, translator, or semantic truth certificate.
+_HR_UNAUTHORIZED_SCOPE = re.compile(
+    r"\bbez\s+(?:(?:ikakvog|prethodnog|izričitog|odobrenog|ovlaštenog|"
+    r"autoriziranog)\s+){0,3}(?:radnog\s+prostora|odobrenja|"
+    r"dopuštenja|autorizacije)\b", re.I)
+_HR_LOCAL_FILE = re.compile(
+    r"\b(?:datotek\w*|fajl\w*|dokument\w*|map(?:a|e|i|u|ama))\b", re.I)
+_HR_FILE_INSPECTION = re.compile(
+    r"\b(?:čita\w*|cita\w*|čitanj\w*|citanj\w*|pregled\w*|"
+    r"pretraž\w*|pretraz\w*|otvar\w*|otvor\w*|pristup\w*|"
+    r"izlist\w*)\b", re.I)
+_HR_POSITIVE_CAPABILITY = re.compile(
+    r"\b(?:mogu|može[mš]?|moze[mš]?|možemo|možete|može|moći|"
+    r"sposob(?:an|na|no)|moguć(?:e|nost))\b", re.I)
+_HR_DENIED_CAPABILITY = re.compile(
+    r"\b(?:ne\s+(?:mogu|može[mš]?|možemo|možete|smijem|smije|"
+    r"moguće)|nije\s+moguće|nemam\s+(?:pristup|dozvolu)|"
+    r"nisam\s+ovlašten\w*)\b", re.I)
+
+
+def _croatian_unapproved_local_read_claim(text: str, statuses: dict[str, str]) -> bool:
+    # A published capability marked 'requires_workspace' is not authorization.
+    required = {'workspace.read', 'workspace.search', 'workspace.tree'}
+    if not any(statuses.get(key) == 'available_requires_workspace' for key in required):
+        return False
+    # Require all evidence in the SAME short clause; the later correct caveat
+    # must not cancel an earlier false permission claim (LIVE-004 regression).
+    for clause in re.split(r'[.!?;\n]+|\b(?:ali|međutim)\b', str(text or ''), flags=re.I):
+        if (len(clause) > 300 or not _HR_UNAUTHORIZED_SCOPE.search(clause)
+                or not _HR_LOCAL_FILE.search(clause)
+                or not _HR_FILE_INSPECTION.search(clause)
+                or not _HR_POSITIVE_CAPABILITY.search(clause)):
+            continue
+        if _HR_DENIED_CAPABILITY.search(clause):
+            continue
+        return True
+    return False
+
+
 def _unverified_capability_claim(output: str, capability_snapshot: list[dict] | None) -> str | None:
     """Do not accept specific unsupported high-risk assertions as model truth.
 
@@ -222,6 +370,8 @@ def _unverified_capability_claim(output: str, capability_snapshot: list[dict] | 
     statuses = {str(c.get('capability_id')): str(c.get('status'))
                 for c in capability_snapshot if isinstance(c, dict)}
     scoped = bool(_SCOPE.search(text) and _APPROVAL.search(text))
+    if _croatian_unapproved_local_read_claim(text, statuses):
+        return 'croatian_unapproved_local_file_read_claim'
     for clause in clauses:
         if _NEGATIVE.search(clause):
             continue
@@ -325,6 +475,18 @@ def evaluate_response(
             "empty_output",
             1.0,
         )
+
+    # ROOT-LANG-P0.1: universal *observable* contract boundary before
+    # technical acceptance. No model can self-certify fluency here.
+    contract_error = obvious_contract_failure(prompt, output)
+    if contract_error is not None:
+        return QualityResult(False, contract_error, 0.0)
+
+    # P0.4.3c1: guard real observed identity/greeting failures before any
+    # early-return acceptance lane. This can only reject, never fabricate output.
+    observed_failure = observed_regression_failure(prompt, output)
+    if observed_failure is not None:
+        return QualityResult(False, observed_failure, 0.0)
 
     # FIXED5.8G1: enforce only objectively testable explicit response shapes.
     # Do not assume other unconstrained answers are correct or compliant.
@@ -438,6 +600,15 @@ def evaluate_response(
             "exact_prompt_echo",
             similarity,
         )
+
+    if _meta_instruction_echo(prompt, output):
+        return QualityResult(False, "user_instruction_echo", similarity)
+
+    if _direct_answer_meta_preamble(prompt, output):
+        return QualityResult(False, "direct_answer_meta_preamble", similarity)
+
+    if _question_restatement(prompt, output):
+        return QualityResult(False, "direct_answer_question_restatement", similarity)
 
     if (
         len(source) >= 20
