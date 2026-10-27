@@ -266,3 +266,16 @@ model load and generation latency. All real G1/G2/G3 release gates remain closed
 - Owner observed Gateway TCP listener \`PID=28425\` starting **2026-10-27 06:25:59 local**, predating FIX3 technical install receipt timestamp **2026-10-27 14:45:43**. This strongly suggests the running process predates FIX3, but not whether it has hot reload; **post-FIX3 runtime activation has NOT been verified**. Preserve running process; inspect its executable/source command first and plan any restart separately.
 - **Guardian decision:** UDP21-C18-01 \`IN_PROGRESS / UNVERIFIED\`. Require cross-repository full references and function-level calls, Core-to-Gateway mission graph wiring, role-specific DOMAIN evidence, live process revision, complete logs and negatives before considering C01 closure or any C02 mutation. Existing G1/G2/G3 \`BLOCKED\`; no code or production authorization is implied.
 
+
+### UDP21-C18-01 — Cross-module AST call-site evidence received 2026-10-27
+
+**Provenance:** user-supplied read-only terminal AST search of 710 Python files under the local `maestro` and `maestro-gateway` `src/` and `tests/` directories. Parsing errors: **0**. This search is static code evidence only, not proof of executed mission behavior.
+
+- Existing `symbolic_task_prover.prove_symbolic_task` is imported and called by `maestro-gateway/src/maestro_gateway/semantic_verifier.py` (import line 17; call line 380 in the inspected local revision), with additional tests. **Not orphaned; do not duplicate.**
+- Existing `CooperativeAdmission` is imported and instantiated by `maestro-gateway/src/maestro_gateway/cross_process_foreground.py` (import line 13, constructor call line 31). **Not orphaned; do not duplicate.**
+- Existing `GovernedMissionFoundation.analyze/synthesize_council_graph`, `CouncilCapabilityBinding` have 25 and 13 matched AST references respectively in the broad src+tests scan. The displayed graph call sites are tests; a full **production-src-only** caller audit is still needed to establish (or reject) real mission graph wiring.
+- Exact AST expression search for `CouncilId.IT/SC/PR/FN/JR` returned **0** references in scanned src+tests; dynamic string/registry-based routing is NOT ruled out by this result. Trace Council IDs and selectors through Gateway Core request dispatch and actual mission receipts before calling these domains unreachable.
+- Existing `kernel.add_evidence` and `kernel.submit_verdict` calls are present in `maestro-gateway/src/maestro_gateway/mission.py`; this establishes their call sites, **not semantic truth validation**.
+- Gateway listener `PID 28425` was still displayed with a 2026-10-27 06:25:59 start timestamp, predating the FIX3 installation receipt; the Gateway restart/reload and FIX3 end-user validation are **NOT_VERIFIED**.
+- **Guardian C01 finding:** parts of the earlier "possibly unused" hypothesis were falsified. **Do not create** a symbolic prover, admission coordinator, evidence ledger, specialist router or UDP Guardian before examining function-level existing implementations and their actual consumers. C01 stays `IN_PROGRESS / UNVERIFIED`; C02–C06 may not claim implementation PASS. G1/G2/G3 and production gates remain blocked.
+
