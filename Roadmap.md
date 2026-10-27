@@ -279,3 +279,14 @@ model load and generation latency. All real G1/G2/G3 release gates remain closed
 - Gateway listener `PID 28425` was still displayed with a 2026-10-27 06:25:59 start timestamp, predating the FIX3 installation receipt; the Gateway restart/reload and FIX3 end-user validation are **NOT_VERIFIED**.
 - **Guardian C01 finding:** parts of the earlier "possibly unused" hypothesis were falsified. **Do not create** a symbolic prover, admission coordinator, evidence ledger, specialist router or UDP Guardian before examining function-level existing implementations and their actual consumers. C01 stays `IN_PROGRESS / UNVERIFIED`; C02–C06 may not claim implementation PASS. G1/G2/G3 and production gates remain blocked.
 
+
+### UDP21-C18-01 — Production-only AST inspection received 2026-10-27
+
+**Evidence source:** owner-provided read-only AST inspection of current Mac working trees at `dev/checkpoint-v8115-g1p0a1`. No source writes; no functional missions executed.
+
+- Core production source call sites: `maestro/src/maestro/autonomous/runtime.py:453` calls `self.kernel.start_dag_node`. The production AST matching the queried selectors did **not** show an invocation of `GovernedMissionFoundation.synthesize_council_graph` or instantiation of `CouncilCapabilityBinding`. This is negative evidence only for the particular names and scanned `src` trees; dynamic registration/call-by-alias is not excluded.
+- Gateway production source `maestro-gateway/src/maestro_gateway/mission.py` has two directly visible mission-level graph paths: `mission.strike_team` at lines 884 and 1703; `kernel.route` at lines 895 and 1714; `kernel.start_dag_node` at lines 935 and 1759. The observed `CouncilId` attributes in Gateway source are **AI, AY, EX, RX, TX**, and there are no explicit `CouncilId.IT, .SC, .PR, .FN, .JR` references in Gateway source in this AST scan.
+- **Duplicate-prevention directive:** `GovernedMissionFoundation`, `Dispatcher`, `DagEngine`, `CouncilCapabilityBinding`, `ActionFirewall`, the existing quality/evidence/admission modules, APTE Council registry and Guardian infrastructure must be inspected and reused. No second Council router, no duplicate Guardian, no additional Councils.
+- **Gating interpretation:** specialized domain-Council execution in user-facing Gateway missions remains **UNVERIFIED**; do not label Councils 'executed' from registry or UI display alone. Before C02 code changes inspect current Mac `GovernedMissionFoundation` contract/inputs, gateway mission Core runtime, autonomous mission routing paths, actual Council binding rules, approval/evidence coupling and negative tests. Check current runtime restart/live version separately.
+- **C01 checkpoint:** `IN_PROGRESS`, not a completed anti-duplication audit; C02 implementation `BLOCKED`; existing G1/G2/G3 production gates `BLOCKED`. This note is planning/evidence governance only and does not certify a source integration.
+
