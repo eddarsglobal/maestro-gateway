@@ -242,3 +242,15 @@ model load and generation latency. All real G1/G2/G3 release gates remain closed
 - This roadmap instructs the existing Guardian workflows when invoked by a developer/CI/authorized owner. **It is not proof that any daemon or background monitoring was started.**
 
 **Current evidence verdict for these checkpoints:** C00–C06 \`NOT_RUN / BLOCKED FOR INSTALLATION\`; no source patch or UDP runtime implementation is certified here. The previous Mac FIX3 result has not yet been supplied. UDP specification itself is \`SPECIFICATION_DRAFT / NOT_BENCHMARKED / NOT_CERTIFIED\`.
+
+### UDP21-C18-00 — Mac field evidence received 2026-10-27 (checkpoint OPEN)
+
+**Evidence origin:** owner-provided read-only Terminal output, not an independent source-file inspection, not a CI run, not a real Gateway mission and not an authorized Guardian certification.
+
+- Installed local branch across all three repositories: `dev/checkpoint-v8115-g1p0a1`; HEADs `maestro=e46ef5a7e8576b758290c0b5f6f5309449d479e1`, `maestro-gateway=febde93f7eaad59d836e98a351f7cd428be50ff1`, `maestro-ui=890a03e70f7f3d6ae1e424deb65a972b49930596`. All working trees reported **DIRTY/UNKNOWN**. Do not replace, reset, stage, commit or push these uncommitted sources as part of this roadmap review.
+- Installed FIX3 first-run model-choice receipt reported `INSTALLED_TECHNICAL_ONLY_RESTART_PENDING`, `guardian=G1_REMEDIATE`, `functional_live=NOT_TESTED`, `release_authorized=false`, `models_downloaded=0`. The owner's grep of the install log reports `CORE_UNITTEST_PASSED=1426` and `GATEWAY_UNITTEST_PASSED=862`; the entire test logs, UI build and live post-restart user scenario have not been independently examined here.
+- Owner-reported SHA-256: `maestro-gateway/src/maestro_gateway/mission.py=c620a76348067536f90cb258fa33be21655ad30214775a38c8fc1cfbbd3a29ff`; `server.py=ace552acccd08e7b0a27587328dc19fb627dee0a07998397771aaa5e7cf1e942`; `maestro-ui/src/App.tsx=67a24d1a194cd7172a349852987722ceb668d90f312a338031de6dcb61ed7b84`.
+- **Previously unseen local changes exist**, including `semantic_verifier.py`, `symbolic_task_prover.py`, `sovereign_evidence_ledger.py`, `delivery_contracts.py`, `response_effort.py`, `response_constraints.py`, `language_quality_governor.py`, `native_linguistic_revision.py`, `cooperative_admission.py`, `effect_journal.py`, and additional regressions. File presence and Git dirty status DO NOT establish their runtime behavior, integrity, or effect.
+- **Guardian action required:** inspect these exact local files and their call sites, search for the same UDP/Council mechanisms before any new development, reconcile the FIX3 live Gateway restart/use with source-revision receipts, and verify full scoped regressions without overwriting working changes. Do not install the earlier provisional UDP mission patch.
+- **Scoped gate:** C00 `UNVERIFIED` (partial evidence only); C01 `NOT_RUN` (read-only inspection permitted but no implementation), C02-C06 `BLOCKED`. Existing G1/G2/G3 release gates remain blocked. No new Council, Guardian, router, model-discovery system, or UDP parallel engine is authorized by this record.
+
