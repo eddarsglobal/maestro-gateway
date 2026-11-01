@@ -76,3 +76,31 @@ python3 agents/Roadmap_guardian.py live-health
 `status` et `git` ne prouvent que les sources. `next` doit refuser tout passage avant que M0 ne dispose de véritables preuves certifiées. `live-health` teste seulement la connexion HTTP réelle à un Gateway local — **pas** l'inférence, l'effet d'une mission ou la production. `prepublish` reste fail-closed.
 
 Ce document est un contrat de développement, **pas une certification du Guardian**.
+
+<!-- GUARDIAN_EXISTENCE_FIRST_20261101 -->
+## ORDRE IMPÉRATIF — VÉRIFIER L'EXISTANT AVANT TOUT DÉVELOPPEMENT
+
+**Ordre du propriétaire, obligatoire pour chaque point M0–M7.** Après des semaines de développement, une case vide du Roadmap NE PROUVE PAS que la fonctionnalité est absente. **Aucun développement, patch, duplication ou remplacement n'est autorisé avant recherche dans GitHub ET dans les sources locales.**
+
+### PRE-DEVELOPMENT DISCOVERY GATE — séquence non contournable
+
+1. **Définir** le point exact, ses sous-exigences et la preuve d'acceptation attendue. Rechercher décisions, Roadmaps, Guardians, anciens correctifs, historiques, logs, tests et tickets liés ; une mention n'est pas une preuve fonctionnelle.
+2. **Analyser GitHub** sur les trois dépôts officiels §eddarsglobal/maestro§, §eddarsglobal/maestro-gateway§ et §eddarsglobal/maestro-ui§ : branches §main§ et branche de développement, commits et PR, codes, routes, classes, fonctions, tests, documentation et intégrations. Enregistrer SHAs complets et fichiers probants. Si GitHub n'est pas accessible : §BLOCK_DISCOVERY_INCOMPLETE§, jamais « absent ».
+3. **Analyser les trois worktrees locaux** : branche, HEAD, fichiers suivis/modifiés/non suivis, scripts, tests, dépendances et traces historiques. Vérifier l'exécutable actif sur le Mac ; une fonctionnalité présente localement mais absente de GitHub doit être **conservée**, jamais écrasée.
+4. **Reconstituer l'intégration réelle** UI → Gateway → Core → outils/inférence → preuves, vérifier permissions, appels effectifs et chemins d'échec. Différencier source, mocks, tests déterministes, essais LIVE passés et effets LIVE vérifiés sur le commit actuel.
+5. **Remplir une matrice d'existence** par sous-exigence avec preuve du chemin/fonction/commit : §PRESENT_VERIFIED§, §PRESENT_UNTESTED§, §PRESENT_PARTIAL§, §BROKEN§, §MISSING_CONFIRMED§ ou §UNKNOWN§. Les simples occurrences de mots ne certifient ni présence opérationnelle ni absence.
+6. **Décider AVANT création** : §REUSE§ (déjà bon), §TEST_ONLY§ (présent mais non certifié), §REPAIR§ (défaut prouvé), §UPDATE§ (obsolète), §INTEGRATE§ (non raccordé) ; §CREATE§ est permis **uniquement** si absence démontrée par l'audit GitHub + local + runtime et approuvée explicitement. En cas de doute : §BLOCK/INVESTIGATE§.
+7. **Appliquer le changement minimal** : ne pas recréer de module, route, test, Guardian, service ni architecture lorsqu'un mécanisme réutilisable existe ; sauvegarde, rollback, autorisation humaine et contrôle de non-régression obligatoires.
+8. **Vérifier le travail réel** sur le Mac avec preuves indépendantes, tests positifs/négatifs, revue et approbation ; synchroniser GitHub/local sans écrasement, puis seulement ordonner le jalon suivant après §CERTIFIED§.
+
+### Fiche requise : EXISTING_IMPLEMENTATION_AUDIT
+
+Pour chaque point, conserver : §point_id§ ; objectif, critères ; §github_checked§ (trois dépôts, branches, SHA, fichiers et historique) ; §local_checked§ (HEAD, changements suivis et non suivis, code réellement exécuté) ; §found_implementations§ ; §gap_matrix§ ; §live_evidence§ ; §decision§ (§REUSE/TEST_ONLY/REPAIR/UPDATE/INTEGRATE/CREATE/BLOCK§) ; `minimal_change_plan` ; autorisations ; sauvegardes ; contrôle de régression ; `final_verdict`.
+
+**INTERDICTION DE CRÉER AVANT VÉRIFICATION DE L'EXISTANT.** Aucun `PASS` de tests unitaires, rapport ou simulation ne remplace l'inspection GitHub/local ni les effets vérifiés. Ne jamais déduire `CREATE` d'une case Roadmap vide.
+
+### Contrôle de l'agent
+
+`python3 agents/Roadmap_guardian.py inspect-point M0` (ou M1…M7) doit rechercher les **traces déjà présentes** dans les arbres locaux et les branches GitHub, en affichant uniquement des chemins et des métadonnées sans divulguer de secret. Ce diagnostic n'est **pas** une certification fonctionnelle ; il échoue fermé si GitHub ou les fichiers sont indisponibles et **n'autorise jamais automatiquement du nouveau code**. Après ce diagnostic, revue humaine et décision documentée obligatoires.
+
+`DISCOVERY=INCOMPLETE` ⇒ `DEVELOPMENT_AUTHORIZATION=BLOCK`. `DISCOVERY=REVIEW_REQUIRED` ⇒ `DEVELOPMENT_AUTHORIZATION=BLOCK_PENDING_OWNER_DECISION`. Seule une décision motivée et autorisée peut initier `REUSE/TEST_ONLY/REPAIR/UPDATE/INTEGRATE/CREATE`. Les jalons M0–M7 restent non certifiés jusqu'à preuve LIVE indépendante.
